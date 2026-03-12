@@ -4,7 +4,8 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 
 ## Required environment variables
 
-- `MONGODB_URI`
+- `MONGODB_URI` (recommended)
+- OR `MONGODB_URI_TEMPLATE` + `MONGODB_DB_USER` + `MONGODB_DB_PASSWORD`
 - `MONGODB_DB_NAME` (optional, defaults to `pushgo_viral`)
 - `PORT` (optional)
 

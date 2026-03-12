@@ -9,11 +9,39 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
-const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "pushgo_viral";
 
+function buildMongoUri() {
+  if (process.env.MONGODB_URI) {
+    return process.env.MONGODB_URI;
+  }
+
+  const template = process.env.MONGODB_URI_TEMPLATE;
+  if (!template) {
+    return "";
+  }
+
+  const dbUser = process.env.MONGODB_DB_USER;
+  const dbPassword = process.env.MONGODB_DB_PASSWORD;
+
+  if (template.includes("<db_username>") && !dbUser) {
+    return "";
+  }
+  if (template.includes("<db_password>") && !dbPassword) {
+    return "";
+  }
+
+  return template
+    .replace("<db_username>", encodeURIComponent(dbUser || ""))
+    .replace("<db_password>", encodeURIComponent(dbPassword || ""));
+}
+
+const MONGODB_URI = buildMongoUri();
+
 if (!MONGODB_URI) {
-  console.error("Missing MONGODB_URI environment variable");
+  console.error(
+    "Missing Mongo config. Set MONGODB_URI or MONGODB_URI_TEMPLATE (+ MONGODB_DB_USER/MONGODB_DB_PASSWORD)."
+  );
   process.exit(1);
 }
 
