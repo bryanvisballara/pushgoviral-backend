@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const { MongoClient } = require("mongodb");
+const crypto = require("crypto");
+const { MongoClient, ObjectId } = require("mongodb");
 
 require("dotenv").config();
 
@@ -13,6 +14,9 @@ const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "pushgo_viral";
 const DEFAULT_COP_PER_USD = Number(process.env.DEFAULT_COP_PER_USD || 4100);
 const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || "";
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://pushgoviral.com";
+const ADMIN_SESSION_TTL_MS = Number(process.env.ADMIN_SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+
+const adminSessions = new Map();
 
 function buildMongoUri() {
   if (process.env.MONGODB_URI) {
@@ -69,6 +73,71 @@ function normalizeStatus(input) {
   return allowed.has(value) ? value : "pending";
 }
 
+function startOfDay(date = new Date()) {
+  const value = new Date(date);
+  value.setHours(0, 0, 0, 0);
+  return value;
+}
+
+function startOfWeek(date = new Date()) {
+  const value = startOfDay(date);
+  const day = value.getDay();
+  const diff = day === 0 ? 6 : day - 1;
+  value.setDate(value.getDate() - diff);
+  return value;
+}
+
+function startOfMonth(date = new Date()) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+
+function toObjectId(id) {
+  if (!id || !ObjectId.isValid(id)) {
+    return null;
+  }
+  return new ObjectId(id);
+}
+
+async function getAdminFromToken(req) {
+  const authHeader = req.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  if (!token) {
+    return null;
+  }
+
+  const currentSession = adminSessions.get(token);
+  if (!currentSession || currentSession.expiresAt < Date.now()) {
+    adminSessions.delete(token);
+    return null;
+  }
+
+  const database = await getDb();
+  const admin = await database.collection("admin_users").findOne(
+    { _id: currentSession.adminId },
+    { projection: { password: 0 } }
+  );
+  if (!admin || admin.status !== "active") {
+    adminSessions.delete(token);
+    return null;
+  }
+
+  return { token, admin };
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    const session = await getAdminFromToken(req);
+    if (!session) {
+      return res.status(401).json({ error: "Admin authentication required" });
+    }
+    req.adminSession = session;
+    return next();
+  } catch (error) {
+    console.error("admin-auth-error", error);
+    return res.status(401).json({ error: "Admin authentication failed" });
+  }
+}
+
 function resolveWebhookBaseUrl(req) {
   const explicitBase = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
   if (explicitBase) {
@@ -105,6 +174,294 @@ app.get("/", (_req, res) => {
     service: "pushgoviral-backend",
     webhookHint: "Use /api/payments/mercadopago/webhook for Mercado Pago notifications",
   });
+});
+
+app.post("/api/admin/login", async (req, res) => {
+  try {
+    const usernameOrEmail = String(req.body?.username || req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+
+    if (!usernameOrEmail || !password) {
+      return res.status(400).json({ error: "username/email and password are required" });
+    }
+
+    const database = await getDb();
+    const admin = await database.collection("admin_users").findOne({
+      $or: [{ username: usernameOrEmail }, { email: usernameOrEmail }],
+    });
+
+    if (!admin || admin.status !== "active" || admin.password !== password) {
+      return res.status(401).json({ error: "Invalid admin credentials" });
+    }
+
+    const token = crypto.randomBytes(24).toString("hex");
+    const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
+    adminSessions.set(token, { adminId: admin._id, expiresAt });
+
+    return res.json({
+      ok: true,
+      token,
+      expiresAt,
+      admin: {
+        id: admin._id,
+        username: admin.username,
+        email: admin.email,
+        role: admin.role,
+        displayName: admin.displayName || admin.username,
+      },
+    });
+  } catch (error) {
+    console.error("admin-login-error", error);
+    return res.status(500).json({ error: "Could not sign in admin" });
+  }
+});
+
+app.post("/api/admin/logout", requireAdmin, (req, res) => {
+  adminSessions.delete(req.adminSession.token);
+  return res.json({ ok: true });
+});
+
+app.get("/api/admin/me", requireAdmin, (req, res) => {
+  return res.json({ ok: true, admin: req.adminSession.admin });
+});
+
+app.get("/api/admin/users", requireAdmin, async (_req, res) => {
+  try {
+    const database = await getDb();
+    const users = await database
+      .collection("users")
+      .aggregate([
+        {
+          $lookup: {
+            from: "wallets",
+            localField: "_id",
+            foreignField: "userId",
+            as: "wallet",
+          },
+        },
+        {
+          $project: {
+            _id: 1,
+            firstName: 1,
+            lastName: 1,
+            username: 1,
+            email: 1,
+            role: 1,
+            status: 1,
+            createdAt: 1,
+            balanceUsd: { $ifNull: [{ $arrayElemAt: ["$wallet.balance", 0] }, 0] },
+          },
+        },
+        { $sort: { createdAt: -1, _id: 1 } },
+      ])
+      .toArray();
+
+    return res.json({ ok: true, users });
+  } catch (error) {
+    console.error("admin-users-error", error);
+    return res.status(500).json({ error: "Could not fetch users" });
+  }
+});
+
+app.get("/api/admin/orders", requireAdmin, async (req, res) => {
+  try {
+    const status = String(req.query?.status || "pending").toLowerCase();
+    const allowed = new Set(["pending", "in_progress", "completed", "canceled", "all"]);
+    if (!allowed.has(status)) {
+      return res.status(400).json({ error: "Invalid status filter" });
+    }
+
+    const filter = status === "all" ? {} : { status };
+    const database = await getDb();
+    const orders = await database.collection("orders").find(filter).sort({ createdAt: -1 }).limit(500).toArray();
+
+    return res.json({
+      ok: true,
+      orders: orders.map((item) => ({ ...item, _id: String(item._id) })),
+    });
+  } catch (error) {
+    console.error("admin-orders-error", error);
+    return res.status(500).json({ error: "Could not fetch orders" });
+  }
+});
+
+app.patch("/api/admin/orders/:id/complete", requireAdmin, async (req, res) => {
+  try {
+    const database = await getDb();
+    const rawId = String(req.params.id || "");
+    const objectId = toObjectId(rawId);
+    const filter = objectId ? { _id: objectId } : { _id: rawId };
+
+    const result = await database.collection("orders").findOneAndUpdate(
+      filter,
+      { $set: { status: "completed", updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    if (!result.value) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    return res.json({ ok: true, order: { ...result.value, _id: String(result.value._id) } });
+  } catch (error) {
+    console.error("admin-order-complete-error", error);
+    return res.status(500).json({ error: "Could not complete order" });
+  }
+});
+
+app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
+  try {
+    const database = await getDb();
+    const services = await database.collection("service_prices").find({}).sort({ label: 1 }).toArray();
+    return res.json({
+      ok: true,
+      services: services.map((item) => ({
+        ...item,
+        _id: String(item._id),
+        costPerUnitUsd: Number(item.costPerUnitUsd || 0),
+        unitPriceUsd: Number(item.unitPriceUsd || 0),
+      })),
+    });
+  } catch (error) {
+    console.error("admin-service-prices-error", error);
+    return res.status(500).json({ error: "Could not fetch service prices" });
+  }
+});
+
+app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
+  try {
+    const key = String(req.params.key || "").trim();
+    const unitPriceUsd = Number(req.body?.unitPriceUsd);
+    const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
+
+    if (!key || !Number.isFinite(unitPriceUsd) || unitPriceUsd < 0 || !Number.isFinite(costPerUnitUsd) || costPerUnitUsd < 0) {
+      return res.status(400).json({ error: "key, unitPriceUsd and costPerUnitUsd are required" });
+    }
+
+    const database = await getDb();
+    const result = await database.collection("service_prices").findOneAndUpdate(
+      { key },
+      {
+        $set: {
+          unitPriceUsd,
+          costPerUnitUsd,
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (!result.value) {
+      return res.status(404).json({ error: "Service not found" });
+    }
+
+    return res.json({ ok: true, service: { ...result.value, _id: String(result.value._id) } });
+  } catch (error) {
+    console.error("admin-service-price-update-error", error);
+    return res.status(500).json({ error: "Could not update service price" });
+  }
+});
+
+app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
+  try {
+    const database = await getDb();
+    const now = new Date();
+    const dayStart = startOfDay(now);
+    const weekStart = startOfWeek(now);
+    const monthStart = startOfMonth(now);
+
+    const [ordersToday, ordersWeek, ordersMonth] = await Promise.all([
+      database.collection("orders").countDocuments({ createdAt: { $gte: dayStart } }),
+      database.collection("orders").countDocuments({ createdAt: { $gte: weekStart } }),
+      database.collection("orders").countDocuments({ createdAt: { $gte: monthStart } }),
+    ]);
+
+    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg] = await Promise.all([
+      database.collection("orders").aggregate([{ $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } }]).toArray(),
+      database
+        .collection("orders")
+        .aggregate([
+          {
+            $lookup: {
+              from: "service_prices",
+              localField: "service",
+              foreignField: "label",
+              as: "serviceCfg",
+            },
+          },
+          {
+            $addFields: {
+              unitCost: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] },
+            },
+          },
+          {
+            $addFields: {
+              computedCost: {
+                $multiply: [{ $toDouble: "$quantity" }, { $toDouble: "$unitCost" }],
+              },
+              computedCharge: { $toDouble: "$chargeUsd" },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $subtract: ["$computedCharge", "$computedCost"] } },
+            },
+          },
+        ])
+        .toArray(),
+      database
+        .collection("wallet_transactions")
+        .aggregate([
+          { $match: { provider: "mercadopago", status: "approved" } },
+          { $group: { _id: null, total: { $sum: { $toDouble: "$amountUsd" } } } },
+        ])
+        .toArray(),
+      database
+        .collection("wallet_transactions")
+        .aggregate([
+          { $match: { provider: "mercadopago", status: "approved" } },
+          {
+            $group: {
+              _id: null,
+              total: {
+                $sum: {
+                  $toDouble: {
+                    $ifNull: ["$transactionFeeUsd", { $max: [{ $subtract: ["$amountUsd", "$creditedAmountUsd"] }, 0] }],
+                  },
+                },
+              },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    const totalOrdersRevenue = Number(orderRevenueAgg[0]?.total || 0);
+    const totalOrdersProfit = Number(orderProfitAgg[0]?.total || 0);
+    const totalTopupRevenue = Number(topupRevenueAgg[0]?.total || 0);
+    const totalTopupFee = Number(topupFeeAgg[0]?.total || 0);
+    const totalUtility = Number((totalOrdersProfit + totalTopupFee).toFixed(2));
+
+    return res.json({
+      ok: true,
+      kpis: {
+        ordersToday,
+        ordersWeek,
+        ordersMonth,
+      },
+      totals: {
+        topupsRevenueUsd: Number(totalTopupRevenue.toFixed(2)),
+        ordersRevenueUsd: Number(totalOrdersRevenue.toFixed(2)),
+        ordersProfitUsd: Number(totalOrdersProfit.toFixed(2)),
+        topupsFeeUsd: Number(totalTopupFee.toFixed(2)),
+        totalUtilityUsd: totalUtility,
+      },
+    });
+  } catch (error) {
+    console.error("admin-overview-error", error);
+    return res.status(500).json({ error: "Could not fetch overview" });
+  }
 });
 
 app.get("/api/public/settings/exchange-rate", async (_req, res) => {

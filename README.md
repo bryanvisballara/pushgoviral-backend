@@ -18,6 +18,32 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `POST /api/payments/mercadopago/preference`
 - `POST /api/payments/mercadopago/webhook`
 
+## Admin API
+
+- `POST /api/admin/login`
+- `POST /api/admin/logout`
+- `GET /api/admin/me`
+- `GET /api/admin/users`
+- `GET /api/admin/orders?status=pending|completed|all`
+- `PATCH /api/admin/orders/:id/complete`
+- `GET /api/admin/service-prices`
+- `PUT /api/admin/service-prices/:key`
+- `GET /api/admin/overview`
+
+## Admin Seed
+
+Run this once to create/update the administrative user and default service costs:
+
+```bash
+npm run seed:admin
+```
+
+Seeded admin credentials:
+
+- username: `admin`
+- email: `admin@pushgo.com`
+- password: `AdminPushGo2026!`
+
 ## Mercado Pago webhook test URL
 
 Use this exact URL in Mercado Pago notifications:
