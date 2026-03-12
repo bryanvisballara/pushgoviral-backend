@@ -10,6 +10,9 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "pushgo_viral";
+const DEFAULT_COP_PER_USD = Number(process.env.DEFAULT_COP_PER_USD || 4100);
+const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || "";
+const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://pushgoviral.com";
 
 function buildMongoUri() {
   if (process.env.MONGODB_URI) {
@@ -66,8 +69,217 @@ function normalizeStatus(input) {
   return allowed.has(value) ? value : "pending";
 }
 
+function resolveWebhookBaseUrl(req) {
+  const explicitBase = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+  if (explicitBase) {
+    return String(explicitBase).replace(/\/+$/, "");
+  }
+  const host = req.get("host");
+  return `https://${host}`;
+}
+
+async function creditWalletBalance(database, userId, amountUsd) {
+  const numericAmount = Number(amountUsd || 0);
+  if (!userId || !Number.isFinite(numericAmount) || numericAmount <= 0) {
+    return;
+  }
+
+  await database.collection("wallets").updateOne(
+    { userId: String(userId) },
+    {
+      $setOnInsert: { userId: String(userId), currency: "USD" },
+      $inc: { balance: numericAmount },
+      $set: { updatedAt: new Date() },
+    },
+    { upsert: true }
+  );
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "pushgoviral-backend",
+    webhookHint: "Use /api/payments/mercadopago/webhook for Mercado Pago notifications",
+  });
+});
+
+app.get("/api/public/settings/exchange-rate", async (_req, res) => {
+  try {
+    const database = await getDb();
+    const setting = await database.collection("app_settings").findOne({ key: "cop_per_usd" });
+    const copPerUsd = Number(setting?.value || DEFAULT_COP_PER_USD);
+    return res.json({ ok: true, copPerUsd });
+  } catch (error) {
+    console.error("exchange-rate-error", error);
+    return res.status(500).json({ error: "Could not fetch exchange rate" });
+  }
+});
+
+app.post("/api/payments/mercadopago/preference", async (req, res) => {
+  try {
+    if (!MERCADOPAGO_ACCESS_TOKEN) {
+      return res.status(500).json({ error: "Missing MERCADOPAGO_ACCESS_TOKEN" });
+    }
+
+    const amountUsd = Number(req.body?.amountUsd || 0);
+    const userId = String(req.body?.userId || "guest");
+    const amountCop = Number(req.body?.amountCop || 0);
+
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ error: "amountUsd is required and must be > 0" });
+    }
+
+    const database = await getDb();
+    const now = new Date();
+    const txId = `mp_${Date.now()}`;
+
+    await database.collection("wallet_transactions").insertOne({
+      _id: txId,
+      provider: "mercadopago",
+      type: "topup",
+      status: "pending",
+      userId,
+      amountUsd,
+      amountCop: Number.isFinite(amountCop) ? amountCop : null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const webhookBase = resolveWebhookBaseUrl(req);
+    const preferencePayload = {
+      items: [
+        {
+          title: "PushGo Viral Balance Top-up",
+          quantity: 1,
+          currency_id: "USD",
+          unit_price: amountUsd,
+        },
+      ],
+      external_reference: txId,
+      metadata: {
+        txId,
+        userId,
+        amountUsd,
+      },
+      notification_url: `${webhookBase}/api/payments/mercadopago/webhook`,
+      back_urls: {
+        success: `${FRONTEND_BASE_URL}/add-funds.html?status=success`,
+        pending: `${FRONTEND_BASE_URL}/add-funds.html?status=pending`,
+        failure: `${FRONTEND_BASE_URL}/add-funds.html?status=failure`,
+      },
+      auto_return: "approved",
+    };
+
+    const mpResponse = await fetch("https://api.mercadopago.com/checkout/preferences", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(preferencePayload),
+    });
+
+    const mpData = await mpResponse.json().catch(() => null);
+    if (!mpResponse.ok || !mpData) {
+      console.error("mercadopago-preference-error", mpData || mpResponse.status);
+      return res.status(502).json({ error: "Could not create Mercado Pago preference" });
+    }
+
+    await database.collection("wallet_transactions").updateOne(
+      { _id: txId },
+      {
+        $set: {
+          mpPreferenceId: mpData.id,
+          initPoint: mpData.init_point || null,
+          sandboxInitPoint: mpData.sandbox_init_point || null,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return res.status(201).json({
+      ok: true,
+      txId,
+      preferenceId: mpData.id,
+      initPoint: mpData.init_point || null,
+      sandboxInitPoint: mpData.sandbox_init_point || null,
+      checkoutUrl: mpData.init_point || mpData.sandbox_init_point || null,
+    });
+  } catch (error) {
+    console.error("mercadopago-preference-route-error", error);
+    return res.status(500).json({ error: "Could not create Mercado Pago preference" });
+  }
+});
+
+app.post("/api/payments/mercadopago/webhook", async (req, res) => {
+  try {
+    const database = await getDb();
+
+    await database.collection("mp_webhooks").insertOne({
+      body: req.body || {},
+      query: req.query || {},
+      headers: {
+        "x-signature": req.get("x-signature") || null,
+        "x-request-id": req.get("x-request-id") || null,
+      },
+      receivedAt: new Date(),
+    });
+
+    const action = String(req.body?.action || "");
+    const maybePaymentId = req.body?.data?.id || req.query?.["data.id"] || req.query?.id;
+
+    if (action === "payment.updated" && maybePaymentId && MERCADOPAGO_ACCESS_TOKEN) {
+      const paymentResponse = await fetch(`https://api.mercadopago.com/v1/payments/${maybePaymentId}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${MERCADOPAGO_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      const paymentData = await paymentResponse.json().catch(() => null);
+      if (paymentResponse.ok && paymentData) {
+        const externalRef = String(paymentData.external_reference || paymentData.metadata?.txId || "");
+        const paymentStatus = String(paymentData.status || "pending").toLowerCase();
+        const metadataUserId = String(paymentData.metadata?.userId || "");
+        const amountUsd = Number(paymentData.metadata?.amountUsd || paymentData.transaction_amount || 0);
+
+        if (externalRef) {
+          await database.collection("wallet_transactions").updateOne(
+            { _id: externalRef },
+            {
+              $set: {
+                mpPaymentId: String(paymentData.id || maybePaymentId),
+                status: paymentStatus,
+                paymentPayload: paymentData,
+                updatedAt: new Date(),
+              },
+            }
+          );
+
+          if (paymentStatus === "approved" && metadataUserId && amountUsd > 0) {
+            const tx = await database.collection("wallet_transactions").findOne({ _id: externalRef });
+            if (!tx?.creditedAt) {
+              await creditWalletBalance(database, metadataUserId, amountUsd);
+              await database.collection("wallet_transactions").updateOne(
+                { _id: externalRef },
+                { $set: { creditedAt: new Date() } }
+              );
+            }
+          }
+        }
+      }
+    }
+
+    return res.status(200).json({ ok: true, received: true });
+  } catch (error) {
+    console.error("mercadopago-webhook-error", error);
+    return res.status(200).json({ ok: false, received: true });
+  }
 });
 
 app.post("/api/orders/create", async (req, res) => {

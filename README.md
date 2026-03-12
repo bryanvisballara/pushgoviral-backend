@@ -14,6 +14,17 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `GET /health`
 - `POST /api/orders/create`
 - `GET /api/orders/history?userId=u1`
+- `GET /api/public/settings/exchange-rate`
+- `POST /api/payments/mercadopago/preference`
+- `POST /api/payments/mercadopago/webhook`
+
+## Mercado Pago webhook test URL
+
+Use this exact URL in Mercado Pago notifications:
+
+`https://pushgoviral-backend.onrender.com/api/payments/mercadopago/webhook`
+
+Do not use only the domain root (`https://pushgoviral-backend.onrender.com`) for webhook tests.
 
 ## Run locally
 
