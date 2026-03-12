@@ -125,11 +125,19 @@ app.post("/api/payments/mercadopago/preference", async (req, res) => {
       return res.status(500).json({ error: "Missing MERCADOPAGO_ACCESS_TOKEN" });
     }
 
-    const amountUsd = Number(req.body?.amountUsd || 0);
+    const chargeAmountUsd = Number(req.body?.amountUsd || 0);
+    const creditedAmountRaw = Number(req.body?.creditedAmountUsd);
+    const transactionFeeRaw = Number(req.body?.transactionFeeUsd);
+    const creditedAmountUsd =
+      Number.isFinite(creditedAmountRaw) && creditedAmountRaw > 0 ? creditedAmountRaw : chargeAmountUsd;
+    const transactionFeeUsd =
+      Number.isFinite(transactionFeeRaw) && transactionFeeRaw >= 0
+        ? transactionFeeRaw
+        : Math.max(0, Number((chargeAmountUsd - creditedAmountUsd).toFixed(2)));
     const userId = String(req.body?.userId || "guest");
     const amountCop = Number(req.body?.amountCop || 0);
 
-    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+    if (!Number.isFinite(chargeAmountUsd) || chargeAmountUsd <= 0) {
       return res.status(400).json({ error: "amountUsd is required and must be > 0" });
     }
 
@@ -143,7 +151,9 @@ app.post("/api/payments/mercadopago/preference", async (req, res) => {
       type: "topup",
       status: "pending",
       userId,
-      amountUsd,
+      amountUsd: chargeAmountUsd,
+      creditedAmountUsd,
+      transactionFeeUsd,
       amountCop: Number.isFinite(amountCop) ? amountCop : null,
       createdAt: now,
       updatedAt: now,
@@ -156,14 +166,17 @@ app.post("/api/payments/mercadopago/preference", async (req, res) => {
           title: "PushGo Viral Balance Top-up",
           quantity: 1,
           currency_id: "USD",
-          unit_price: amountUsd,
+          unit_price: chargeAmountUsd,
         },
       ],
       external_reference: txId,
       metadata: {
         txId,
         userId,
-        amountUsd,
+        amountUsd: chargeAmountUsd,
+        chargeAmountUsd,
+        creditedAmountUsd,
+        transactionFeeUsd,
       },
       notification_url: `${webhookBase}/api/payments/mercadopago/webhook`,
       back_urls: {
@@ -246,18 +259,30 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
         const externalRef = String(paymentData.external_reference || paymentData.metadata?.txId || "");
         const paymentStatus = String(paymentData.status || "pending").toLowerCase();
         const metadataUserId = String(paymentData.metadata?.userId || "");
-        const amountUsd = Number(paymentData.metadata?.amountUsd || paymentData.transaction_amount || 0);
+        const chargeAmountUsd = Number(paymentData.metadata?.chargeAmountUsd || paymentData.metadata?.amountUsd || 0);
+        const amountUsd = Number(
+          paymentData.metadata?.creditedAmountUsd || paymentData.metadata?.amountUsd || paymentData.transaction_amount || 0
+        );
 
         if (externalRef) {
+          const updateSet = {
+            mpPaymentId: String(paymentData.id || maybePaymentId),
+            status: paymentStatus,
+            paymentPayload: paymentData,
+            updatedAt: new Date(),
+          };
+
+          if (Number.isFinite(chargeAmountUsd) && chargeAmountUsd > 0) {
+            updateSet.amountUsd = chargeAmountUsd;
+          }
+          if (Number.isFinite(amountUsd) && amountUsd > 0) {
+            updateSet.creditedAmountUsd = amountUsd;
+          }
+
           await database.collection("wallet_transactions").updateOne(
             { _id: externalRef },
             {
-              $set: {
-                mpPaymentId: String(paymentData.id || maybePaymentId),
-                status: paymentStatus,
-                paymentPayload: paymentData,
-                updatedAt: new Date(),
-              },
+              $set: updateSet,
             }
           );
 
