@@ -835,7 +835,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
       database.collection("orders").countDocuments({ createdAt: { $gte: monthStart } }),
     ]);
 
-    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg] = await Promise.all([
+    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg] = await Promise.all([
       database.collection("orders").aggregate([{ $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } }]).toArray(),
       database
         .collection("orders")
@@ -894,6 +894,17 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
           },
         ])
         .toArray(),
+      database
+        .collection("wallets")
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $toDouble: { $ifNull: ["$balance", 0] } } },
+            },
+          },
+        ])
+        .toArray(),
     ]);
 
     const totalOrdersRevenue = Number(orderRevenueAgg[0]?.total || 0);
@@ -901,6 +912,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     const totalTopupRevenue = Number(topupRevenueAgg[0]?.total || 0);
     const totalTopupFee = Number(topupFeeAgg[0]?.total || 0);
     const totalUtility = Number((totalOrdersProfit + totalTopupFee).toFixed(2));
+    const totalWalletBalance = Number(totalWalletAgg[0]?.total || 0);
 
     return res.json({
       ok: true,
@@ -915,6 +927,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         ordersProfitUsd: Number(totalOrdersProfit.toFixed(2)),
         topupsFeeUsd: Number(totalTopupFee.toFixed(2)),
         totalUtilityUsd: totalUtility,
+        totalWalletBalanceUsd: Number(totalWalletBalance.toFixed(2)),
       },
     });
   } catch (error) {
