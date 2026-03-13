@@ -835,7 +835,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
       database.collection("orders").countDocuments({ createdAt: { $gte: monthStart } }),
     ]);
 
-    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg] = await Promise.all([
+    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] = await Promise.all([
       database.collection("orders").aggregate([{ $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } }]).toArray(),
       database
         .collection("orders")
@@ -905,6 +905,41 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
           },
         ])
         .toArray(),
+      database
+        .collection("service_prices")
+        .aggregate([
+          {
+            $project: {
+              unitPriceUsd: { $toDouble: { $ifNull: ["$unitPriceUsd", 0] } },
+              costPerUnitUsd: { $toDouble: { $ifNull: ["$costPerUnitUsd", 0] } },
+            },
+          },
+          {
+            $match: {
+              unitPriceUsd: { $gt: 0 },
+              costPerUnitUsd: { $gt: 0 },
+            },
+          },
+          {
+            $project: {
+              profitPercent: {
+                $multiply: [
+                  {
+                    $divide: [{ $subtract: ["$unitPriceUsd", "$costPerUnitUsd"] }, "$costPerUnitUsd"],
+                  },
+                  100,
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              avg: { $avg: "$profitPercent" },
+            },
+          },
+        ])
+        .toArray(),
     ]);
 
     const totalOrdersRevenue = Number(orderRevenueAgg[0]?.total || 0);
@@ -913,6 +948,9 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     const totalTopupFee = Number(topupFeeAgg[0]?.total || 0);
     const totalUtility = Number((totalOrdersProfit + totalTopupFee).toFixed(2));
     const totalWalletBalance = Number(totalWalletAgg[0]?.total || 0);
+    const avgProfitPercent = Number(avgProfitPercentAgg[0]?.avg || 0);
+    const reserveFactor = (100 - avgProfitPercent) / 100;
+    const walletCoverageReserveUsd = Number((totalWalletBalance * reserveFactor).toFixed(2));
 
     return res.json({
       ok: true,
@@ -928,6 +966,8 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         topupsFeeUsd: Number(totalTopupFee.toFixed(2)),
         totalUtilityUsd: totalUtility,
         totalWalletBalanceUsd: Number(totalWalletBalance.toFixed(2)),
+        avgProfitPercent: Number(avgProfitPercent.toFixed(2)),
+        walletCoverageReserveUsd,
       },
     });
   } catch (error) {
