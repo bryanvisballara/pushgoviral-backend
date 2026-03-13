@@ -1496,9 +1496,12 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
     });
 
     const action = String(req.body?.action || "");
-    const maybePaymentId = req.body?.data?.id || req.query?.["data.id"] || req.query?.id;
+    const notificationTopic = String(req.body?.type || req.query?.type || req.query?.topic || "").toLowerCase();
+    const maybePaymentId = req.body?.data?.id || req.query?.["data.id"] || req.query?.id || req.body?.id;
+    const isPaymentNotification =
+      action === "payment.updated" || action === "payment.created" || notificationTopic === "payment";
 
-    if (action === "payment.updated" && maybePaymentId && MERCADOPAGO_ACCESS_TOKEN) {
+    if (isPaymentNotification && maybePaymentId && MERCADOPAGO_ACCESS_TOKEN) {
       const paymentResponse = await fetch(`https://api.mercadopago.com/v1/payments/${maybePaymentId}`, {
         method: "GET",
         headers: {
@@ -1509,15 +1512,34 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
 
       const paymentData = await paymentResponse.json().catch(() => null);
       if (paymentResponse.ok && paymentData) {
-        const externalRef = String(paymentData.external_reference || paymentData.metadata?.txId || "");
-        const paymentStatus = String(paymentData.status || "pending").toLowerCase();
-        const metadataUserId = String(paymentData.metadata?.userId || "");
-        const chargeAmountUsd = Number(paymentData.metadata?.chargeAmountUsd || paymentData.metadata?.amountUsd || 0);
-        const amountUsd = Number(
-          paymentData.metadata?.creditedAmountUsd || paymentData.metadata?.amountUsd || paymentData.transaction_amount || 0
+        const metadata = paymentData.metadata || {};
+        const externalRef = String(
+          paymentData.external_reference || metadata.txId || metadata.tx_id || ""
         );
+        const paymentStatus = String(paymentData.status || "pending").toLowerCase();
+        const metadataUserId = String(metadata.userId || metadata.user_id || "");
+        const metadataChargeAmountUsd = Number(
+          metadata.chargeAmountUsd || metadata.charge_amount_usd || metadata.amountUsd || metadata.amount_usd || 0
+        );
+        const metadataCreditedAmountUsd = Number(
+          metadata.creditedAmountUsd || metadata.credited_amount_usd || metadata.amountUsd || metadata.amount_usd || 0
+        );
+        const paymentCurrency = String(paymentData.currency_id || "").toUpperCase();
+        const paymentTransactionAmount = Number(paymentData.transaction_amount || 0);
+        const safeTransactionAmountUsd =
+          paymentCurrency === "USD" && Number.isFinite(paymentTransactionAmount) && paymentTransactionAmount > 0
+            ? paymentTransactionAmount
+            : 0;
 
         if (externalRef) {
+          const tx = await database.collection("wallet_transactions").findOne({ _id: externalRef });
+          const chargeAmountUsd = Number.isFinite(metadataChargeAmountUsd) && metadataChargeAmountUsd > 0
+            ? metadataChargeAmountUsd
+            : Number(tx?.amountUsd || 0);
+          const creditedAmountUsd = Number.isFinite(metadataCreditedAmountUsd) && metadataCreditedAmountUsd > 0
+            ? metadataCreditedAmountUsd
+            : Number(tx?.creditedAmountUsd || 0) || safeTransactionAmountUsd;
+
           const updateSet = {
             mpPaymentId: String(paymentData.id || maybePaymentId),
             status: paymentStatus,
@@ -1528,8 +1550,8 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
           if (Number.isFinite(chargeAmountUsd) && chargeAmountUsd > 0) {
             updateSet.amountUsd = chargeAmountUsd;
           }
-          if (Number.isFinite(amountUsd) && amountUsd > 0) {
-            updateSet.creditedAmountUsd = amountUsd;
+          if (Number.isFinite(creditedAmountUsd) && creditedAmountUsd > 0) {
+            updateSet.creditedAmountUsd = creditedAmountUsd;
           }
 
           await database.collection("wallet_transactions").updateOne(
@@ -1539,10 +1561,11 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
             }
           );
 
-          if (paymentStatus === "approved" && metadataUserId && amountUsd > 0) {
-            const tx = await database.collection("wallet_transactions").findOne({ _id: externalRef });
+          const resolvedUserId = metadataUserId || String(tx?.userId || "");
+
+          if (paymentStatus === "approved" && resolvedUserId && creditedAmountUsd > 0) {
             if (!tx?.creditedAt) {
-              await creditWalletBalance(database, metadataUserId, amountUsd);
+              await creditWalletBalance(database, resolvedUserId, creditedAmountUsd);
               await database.collection("wallet_transactions").updateOne(
                 { _id: externalRef },
                 { $set: { creditedAt: new Date() } }
