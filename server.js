@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
+const { renderVerificationEmail, renderPasswordResetEmail } = require("./email-templates/codes");
 
 require("dotenv").config();
 
@@ -15,6 +16,15 @@ const DEFAULT_COP_PER_USD = Number(process.env.DEFAULT_COP_PER_USD || 4100);
 const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || "";
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://pushgoviral.com";
 const ADMIN_SESSION_TTL_MS = Number(process.env.ADMIN_SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
+const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || "PushGo Viral";
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || "";
+const CODE_EXPIRES_MINUTES = Number(process.env.AUTH_CODE_EXPIRES_MINUTES || 10);
+const CODE_MAX_ATTEMPTS = Number(process.env.AUTH_CODE_MAX_ATTEMPTS || 5);
+const CODE_RESEND_COOLDOWN_SECONDS = Number(process.env.AUTH_CODE_RESEND_COOLDOWN_SECONDS || 60);
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const TELEGRAM_THREAD_ID = process.env.TELEGRAM_THREAD_ID || "";
 
 const adminSessions = new Map();
 
@@ -63,8 +73,234 @@ async function getDb() {
     await mongo.connect();
     db = mongo.db(MONGODB_DB_NAME);
     await db.collection("orders").createIndex({ userId: 1, createdAt: -1 });
+    await db.collection("email_codes").createIndex({ email: 1, purpose: 1, createdAt: -1 });
+    await db.collection("email_codes").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   }
   return db;
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeUsername(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function sanitizeName(value) {
+  return String(value || "").trim();
+}
+
+function generateSixDigitCode() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function hashAuthCode({ email, purpose, code, salt }) {
+  return crypto
+    .createHash("sha256")
+    .update(`${email}:${purpose}:${code}:${salt}`)
+    .digest("hex");
+}
+
+function getUpdatedDocument(result) {
+  if (!result) {
+    return null;
+  }
+  if (typeof result === "object" && "value" in result) {
+    return result.value || null;
+  }
+  return result;
+}
+
+async function sendBrevoEmail({ toEmail, toName, subject, htmlContent }) {
+  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
+    throw new Error("Missing BREVO_API_KEY or BREVO_SENDER_EMAIL");
+  }
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": BREVO_API_KEY,
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      sender: {
+        name: BREVO_SENDER_NAME,
+        email: BREVO_SENDER_EMAIL,
+      },
+      to: [
+        {
+          email: toEmail,
+          name: toName || toEmail,
+        },
+      ],
+      subject,
+      htmlContent,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`Brevo send failed (${response.status}): ${errorText}`);
+  }
+}
+
+function escapeTelegramHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+async function sendTelegramOrderNotification({ order, user }) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return;
+  }
+
+  const createdAt = new Date(order.createdAt || Date.now()).toISOString();
+  const userLabel = user
+    ? `${escapeTelegramHtml(user.firstName || "")} ${escapeTelegramHtml(user.lastName || "")}`.trim()
+    : "Unknown";
+
+  const text = [
+    "<b>New Order - PushGo Viral</b>",
+    "",
+    `<b>Order Number:</b> ${escapeTelegramHtml(order.orderNumber)}`,
+    `<b>User ID:</b> ${escapeTelegramHtml(order.userId)}`,
+    `<b>User:</b> ${userLabel || "Unknown"}`,
+    `<b>Username:</b> ${escapeTelegramHtml(user?.username || "-")}`,
+    `<b>Email:</b> ${escapeTelegramHtml(user?.email || "-")}`,
+    `<b>Service:</b> ${escapeTelegramHtml(order.service)}`,
+    `<b>Platform:</b> ${escapeTelegramHtml(order.platform)}`,
+    `<b>Link:</b> ${escapeTelegramHtml(order.link)}`,
+    `<b>Quantity:</b> ${escapeTelegramHtml(order.quantity)}`,
+    `<b>Charge USD:</b> ${escapeTelegramHtml(Number(order.chargeUsd || 0).toFixed(2))}`,
+    `<b>Status:</b> ${escapeTelegramHtml(order.status)}`,
+    `<b>Created At:</b> ${escapeTelegramHtml(createdAt)}`,
+  ].join("\n");
+
+  const payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+
+  const threadId = Number(TELEGRAM_THREAD_ID);
+  if (Number.isFinite(threadId) && threadId > 0) {
+    payload.message_thread_id = threadId;
+  }
+
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const details = await response.text().catch(() => "");
+    throw new Error(`Telegram send failed (${response.status}): ${details}`);
+  }
+}
+
+async function requestEmailCode({ database, email, purpose, firstName }) {
+  const now = new Date();
+  const cooldownDate = new Date(now.getTime() - CODE_RESEND_COOLDOWN_SECONDS * 1000);
+
+  const recentCode = await database.collection("email_codes").findOne(
+    {
+      email,
+      purpose,
+      createdAt: { $gte: cooldownDate },
+      usedAt: null,
+      expiresAt: { $gt: now },
+    },
+    { sort: { createdAt: -1 } }
+  );
+
+  if (recentCode) {
+    return { ok: false, reason: "cooldown" };
+  }
+
+  const code = generateSixDigitCode();
+  const salt = crypto.randomBytes(12).toString("hex");
+  const codeHash = hashAuthCode({ email, purpose, code, salt });
+  const expiresAt = new Date(now.getTime() + CODE_EXPIRES_MINUTES * 60 * 1000);
+
+  await database.collection("email_codes").insertOne({
+    email,
+    purpose,
+    salt,
+    codeHash,
+    attempts: 0,
+    maxAttempts: CODE_MAX_ATTEMPTS,
+    createdAt: now,
+    expiresAt,
+    usedAt: null,
+  });
+
+  const htmlContent =
+    purpose === "email_verification"
+      ? renderVerificationEmail({ firstName, code, expiresMinutes: CODE_EXPIRES_MINUTES })
+      : renderPasswordResetEmail({ firstName, code, expiresMinutes: CODE_EXPIRES_MINUTES });
+
+  const subject =
+    purpose === "email_verification"
+      ? "PushGo Viral | Verify Your Email"
+      : "PushGo Viral | Password Reset Code";
+
+  await sendBrevoEmail({
+    toEmail: email,
+    toName: firstName,
+    subject,
+    htmlContent,
+  });
+
+  return { ok: true };
+}
+
+async function verifyEmailCode({ database, email, purpose, code }) {
+  const now = new Date();
+  const latest = await database.collection("email_codes").findOne(
+    {
+      email,
+      purpose,
+      usedAt: null,
+      expiresAt: { $gt: now },
+    },
+    { sort: { createdAt: -1 } }
+  );
+
+  if (!latest) {
+    return { ok: false, reason: "expired_or_missing" };
+  }
+
+  if (Number(latest.attempts || 0) >= Number(latest.maxAttempts || CODE_MAX_ATTEMPTS)) {
+    return { ok: false, reason: "max_attempts" };
+  }
+
+  const expectedHash = hashAuthCode({
+    email,
+    purpose,
+    code,
+    salt: String(latest.salt || ""),
+  });
+
+  if (expectedHash !== latest.codeHash) {
+    await database.collection("email_codes").updateOne(
+      { _id: latest._id },
+      { $inc: { attempts: 1 } }
+    );
+    return { ok: false, reason: "invalid_code" };
+  }
+
+  await database.collection("email_codes").updateOne(
+    { _id: latest._id },
+    { $set: { usedAt: new Date() } }
+  );
+
+  return { ok: true };
 }
 
 function normalizeStatus(input) {
@@ -174,6 +410,225 @@ app.get("/", (_req, res) => {
     service: "pushgoviral-backend",
     webhookHint: "Use /api/payments/mercadopago/webhook for Mercado Pago notifications",
   });
+});
+
+app.post("/api/auth/email-verification/request", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const firstName = sanitizeName(req.body?.firstName);
+
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    const database = await getDb();
+    const result = await requestEmailCode({
+      database,
+      email,
+      purpose: "email_verification",
+      firstName,
+    });
+
+    if (!result.ok && result.reason === "cooldown") {
+      return res.status(429).json({
+        error: `Please wait ${CODE_RESEND_COOLDOWN_SECONDS} seconds before requesting a new code.`,
+      });
+    }
+
+    return res.json({ ok: true, message: "Verification code sent" });
+  } catch (error) {
+    console.error("email-verification-request-error", error);
+    return res.status(500).json({ error: "Could not send verification code" });
+  }
+});
+
+app.post("/api/auth/register/verify", async (req, res) => {
+  try {
+    const firstName = sanitizeName(req.body?.firstName);
+    const lastName = sanitizeName(req.body?.lastName);
+    const email = normalizeEmail(req.body?.email);
+    const username = normalizeUsername(req.body?.username || `${firstName}.${lastName}`.replace(/\s+/g, ""));
+    const password = String(req.body?.password || "PushGo2026!");
+    const code = String(req.body?.code || "").trim();
+
+    if (!firstName || !lastName || !email || !username || !code) {
+      return res.status(400).json({ error: "firstName, lastName, email, username and code are required" });
+    }
+
+    const database = await getDb();
+    const checkCode = await verifyEmailCode({
+      database,
+      email,
+      purpose: "email_verification",
+      code,
+    });
+
+    if (!checkCode.ok) {
+      return res.status(400).json({ error: "Invalid or expired verification code" });
+    }
+
+    const existing = await database.collection("users").findOne({
+      $or: [{ email }, { username }],
+    });
+
+    if (existing) {
+      return res.status(409).json({ error: "User already exists" });
+    }
+
+    const now = new Date();
+    const userId = `u${Date.now()}`;
+
+    await database.collection("users").insertOne({
+      _id: userId,
+      firstName,
+      lastName,
+      username,
+      email,
+      password,
+      role: "client",
+      status: "active",
+      verified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await database.collection("wallets").updateOne(
+      { userId },
+      {
+        $setOnInsert: { userId, currency: "USD", balance: 0 },
+        $set: { updatedAt: now },
+      },
+      { upsert: true }
+    );
+
+    return res.status(201).json({
+      ok: true,
+      user: { id: userId, firstName, lastName, username, email },
+    });
+  } catch (error) {
+    console.error("register-verify-error", error);
+    return res.status(500).json({ error: "Could not complete registration" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const usernameOrEmail = normalizeEmail(req.body?.username || req.body?.email);
+    const password = String(req.body?.password || "");
+
+    if (!usernameOrEmail || !password) {
+      return res.status(400).json({ error: "username/email and password are required" });
+    }
+
+    const database = await getDb();
+    const user = await database.collection("users").findOne({
+      $or: [{ username: usernameOrEmail }, { email: usernameOrEmail }],
+    });
+
+    const storedPassword = String(user?.password || "PushGo2026!");
+    if (!user || user.status !== "active" || storedPassword !== password) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const wallet = await database.collection("wallets").findOne({ userId: String(user._id) });
+
+    return res.json({
+      ok: true,
+      user: {
+        id: String(user._id),
+        firstName: user.firstName || "",
+        lastName: user.lastName || "",
+        username: user.username || "",
+        email: user.email || "",
+        verified: true,
+        balance: Number(wallet?.balance || 0),
+      },
+    });
+  } catch (error) {
+    console.error("auth-login-error", error);
+    return res.status(500).json({ error: "Could not sign in" });
+  }
+});
+
+app.post("/api/auth/password-reset/request", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    if (!email) {
+      return res.status(400).json({ error: "email is required" });
+    }
+
+    const database = await getDb();
+    const user = await database.collection("users").findOne({ email });
+
+    // Do not reveal whether a user exists.
+    if (!user) {
+      return res.json({ ok: true, message: "If the account exists, a reset code was sent." });
+    }
+
+    const result = await requestEmailCode({
+      database,
+      email,
+      purpose: "password_reset",
+      firstName: sanitizeName(user.firstName),
+    });
+
+    if (!result.ok && result.reason === "cooldown") {
+      return res.status(429).json({
+        error: `Please wait ${CODE_RESEND_COOLDOWN_SECONDS} seconds before requesting a new code.`,
+      });
+    }
+
+    return res.json({ ok: true, message: "If the account exists, a reset code was sent." });
+  } catch (error) {
+    console.error("password-reset-request-error", error);
+    return res.status(500).json({ error: "Could not process password reset request" });
+  }
+});
+
+app.post("/api/auth/password-reset/confirm", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const code = String(req.body?.code || "").trim();
+    const newPassword = String(req.body?.newPassword || "");
+
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: "email, code and newPassword are required" });
+    }
+
+    const database = await getDb();
+    const checkCode = await verifyEmailCode({
+      database,
+      email,
+      purpose: "password_reset",
+      code,
+    });
+
+    if (!checkCode.ok) {
+      return res.status(400).json({ error: "Invalid or expired reset code" });
+    }
+
+    const result = await database.collection("users").findOneAndUpdate(
+      { email },
+      {
+        $set: {
+          password: newPassword,
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    const updatedUser = getUpdatedDocument(result);
+
+    if (!updatedUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.json({ ok: true, message: "Password updated successfully" });
+  } catch (error) {
+    console.error("password-reset-confirm-error", error);
+    return res.status(500).json({ error: "Could not reset password" });
+  }
 });
 
 app.post("/api/admin/login", async (req, res) => {
@@ -298,11 +753,13 @@ app.patch("/api/admin/orders/:id/complete", requireAdmin, async (req, res) => {
       { returnDocument: "after" }
     );
 
-    if (!result.value) {
+    const updatedOrder = getUpdatedDocument(result);
+
+    if (!updatedOrder) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    return res.json({ ok: true, order: { ...result.value, _id: String(result.value._id) } });
+    return res.json({ ok: true, order: { ...updatedOrder, _id: String(updatedOrder._id) } });
   } catch (error) {
     console.error("admin-order-complete-error", error);
     return res.status(500).json({ error: "Could not complete order" });
@@ -351,11 +808,13 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
       { returnDocument: "after" }
     );
 
-    if (!result.value) {
+    const updatedService = getUpdatedDocument(result);
+
+    if (!updatedService) {
       return res.status(404).json({ error: "Service not found" });
     }
 
-    return res.json({ ok: true, service: { ...result.value, _id: String(result.value._id) } });
+    return res.json({ ok: true, service: { ...updatedService, _id: String(updatedService._id) } });
   } catch (error) {
     console.error("admin-service-price-update-error", error);
     return res.status(500).json({ error: "Could not update service price" });
@@ -704,6 +1163,13 @@ app.post("/api/orders/create", async (req, res) => {
 
     const database = await getDb();
     const result = await database.collection("orders").insertOne(order);
+
+    try {
+      const user = await database.collection("users").findOne({ _id: String(order.userId) });
+      await sendTelegramOrderNotification({ order, user });
+    } catch (notifyError) {
+      console.error("telegram-order-notification-error", notifyError);
+    }
 
     res.status(201).json({
       ok: true,

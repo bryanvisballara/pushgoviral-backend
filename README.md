@@ -8,6 +8,16 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - OR `MONGODB_URI_TEMPLATE` + `MONGODB_DB_USER` + `MONGODB_DB_PASSWORD`
 - `MONGODB_DB_NAME` (optional, defaults to `pushgo_viral`)
 - `PORT` (optional)
+- `BREVO_API_KEY` (required for email verification / password reset codes)
+- `BREVO_SENDER_EMAIL` (verified sender in Brevo)
+- `BREVO_SENDER_NAME` (optional, defaults to `PushGo Viral`)
+- `FRONTEND_BASE_URL` (optional, defaults to `https://pushgoviral.com`)
+- `AUTH_CODE_EXPIRES_MINUTES` (optional, defaults to `10`)
+- `AUTH_CODE_MAX_ATTEMPTS` (optional, defaults to `5`)
+- `AUTH_CODE_RESEND_COOLDOWN_SECONDS` (optional, defaults to `60`)
+- `TELEGRAM_BOT_TOKEN` (optional, enables order notifications)
+- `TELEGRAM_CHAT_ID` (required to receive Telegram order notifications)
+- `TELEGRAM_THREAD_ID` (optional, for Telegram topics)
 
 ## Endpoints
 
@@ -17,6 +27,14 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `GET /api/public/settings/exchange-rate`
 - `POST /api/payments/mercadopago/preference`
 - `POST /api/payments/mercadopago/webhook`
+
+## Auth Email Code Endpoints
+
+- `POST /api/auth/login`
+- `POST /api/auth/email-verification/request`
+- `POST /api/auth/register/verify`
+- `POST /api/auth/password-reset/request`
+- `POST /api/auth/password-reset/confirm`
 
 ## Admin API
 
