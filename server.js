@@ -925,7 +925,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
               profitPercent: {
                 $multiply: [
                   {
-                    $divide: [{ $subtract: ["$unitPriceUsd", "$costPerUnitUsd"] }, "$costPerUnitUsd"],
+                    $divide: [{ $subtract: ["$unitPriceUsd", "$costPerUnitUsd"] }, "$unitPriceUsd"],
                   },
                   100,
                 ],
