@@ -1673,6 +1673,27 @@ app.get("/api/orders/history", async (req, res) => {
   }
 });
 
+app.get("/api/wallets/:userId/balance", async (req, res) => {
+  try {
+    const userId = String(req.params?.userId || "").trim();
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const database = await getDb();
+    const wallet = await database.collection("wallets").findOne({ userId });
+    return res.json({
+      ok: true,
+      userId,
+      balance: Number(wallet?.balance || 0),
+      currency: String(wallet?.currency || "USD"),
+    });
+  } catch (error) {
+    console.error("wallet-balance-error", error);
+    return res.status(500).json({ error: "Could not fetch wallet balance" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`PushGo backend running on port ${PORT}`);
 });
