@@ -7,7 +7,27 @@ const { renderVerificationEmail, renderPasswordResetEmail } = require("./email-t
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+const allowedCorsOrigins = new Set(
+  [
+    process.env.FRONTEND_BASE_URL,
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+  ].filter(Boolean)
+);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedCorsOrigins.has(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
@@ -16,6 +36,7 @@ const DEFAULT_COP_PER_USD = Number(process.env.DEFAULT_COP_PER_USD || 4100);
 const MERCADOPAGO_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || "";
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "https://pushgoviral.com";
 const ADMIN_SESSION_TTL_MS = Number(process.env.ADMIN_SESSION_TTL_MS || 1000 * 60 * 60 * 8);
+const USER_SESSION_TTL_MS = Number(process.env.USER_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 7);
 const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
 const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || "PushGo Viral";
 const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || "";
@@ -25,8 +46,17 @@ const CODE_RESEND_COOLDOWN_SECONDS = Number(process.env.AUTH_CODE_RESEND_COOLDOW
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const TELEGRAM_THREAD_ID = process.env.TELEGRAM_THREAD_ID || "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_OAUTH_STATE_TTL_MS = Number(process.env.GOOGLE_OAUTH_STATE_TTL_MS || 1000 * 60 * 10);
+const ADMIN_COOKIE_NAME = process.env.ADMIN_COOKIE_NAME || "pushgo_admin_session";
+const USER_COOKIE_NAME = process.env.USER_COOKIE_NAME || "pushgo_user_session";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || "";
 
 const adminSessions = new Map();
+const userSessions = new Map();
+const googleOauthStates = new Map();
 
 function buildMongoUri() {
   if (process.env.MONGODB_URI) {
@@ -89,6 +119,164 @@ function normalizeUsername(value) {
 
 function sanitizeName(value) {
   return String(value || "").trim();
+}
+
+function normalizeUsernameBase(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "")
+    .replace(/^[-_.]+|[-_.]+$/g, "");
+  return normalized;
+}
+
+function splitGoogleName(name, email) {
+  const cleanName = sanitizeName(name);
+  if (cleanName) {
+    const [first, ...rest] = cleanName.split(/\s+/);
+    return {
+      firstName: first || "Google",
+      lastName: rest.join(" ") || "User",
+    };
+  }
+
+  const emailPrefix = String(email || "").split("@")[0] || "googleuser";
+  return {
+    firstName: emailPrefix.slice(0, 24) || "Google",
+    lastName: "User",
+  };
+}
+
+function encodeBase64UrlJson(payload) {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function getBackendBaseUrl(req) {
+  const configured = process.env.RENDER_BACKEND_URL || process.env.BACKEND_BASE_URL;
+  if (configured) {
+    return String(configured).replace(/\/+$/, "");
+  }
+
+  const host = req.get("host");
+  const protocol = req.get("x-forwarded-proto") || req.protocol || "https";
+  return `${protocol}://${host}`;
+}
+
+function getGoogleRedirectUri(req) {
+  const explicit = process.env.GOOGLE_REDIRECT_URI;
+  if (explicit) {
+    return String(explicit).trim();
+  }
+  return `${getBackendBaseUrl(req)}/api/auth/google/callback`;
+}
+
+function buildFrontendRedirect(urlBase, hashPayload) {
+  const cleanedBase = String(urlBase || FRONTEND_BASE_URL || "").replace(/\/+$/, "");
+  const target = cleanedBase.endsWith(".html") ? cleanedBase : `${cleanedBase}/index.html`;
+  return `${target}#${hashPayload}`;
+}
+
+async function generateUniqueUsername(database, preferred, email) {
+  const emailPrefix = String(email || "").split("@")[0] || "googleuser";
+  const base = normalizeUsernameBase(preferred) || normalizeUsernameBase(emailPrefix) || "googleuser";
+
+  for (let i = 0; i < 500; i += 1) {
+    const candidate = i === 0 ? base : `${base}_${i}`;
+    const exists = await database.collection("users").findOne({ username: candidate }, { projection: { _id: 1 } });
+    if (!exists) {
+      return candidate;
+    }
+  }
+
+  return `${base}_${Date.now()}`;
+}
+
+async function upsertGoogleUser({ database, googleProfile }) {
+  const googleId = String(googleProfile.sub || "");
+  const email = normalizeEmail(googleProfile.email);
+  const fullName = sanitizeName(googleProfile.name || "");
+
+  if (!googleId || !email) {
+    throw new Error("Missing Google profile fields");
+  }
+
+  const now = new Date();
+  let user = await database.collection("users").findOne({ email });
+
+  if (user) {
+    const needsUsername = !normalizeUsername(user.username);
+    const nextUsername = needsUsername
+      ? await generateUniqueUsername(database, fullName.replace(/\s+/g, ""), email)
+      : normalizeUsername(user.username);
+
+    const nextFirst = sanitizeName(user.firstName) || splitGoogleName(fullName, email).firstName;
+    const nextLast = sanitizeName(user.lastName) || splitGoogleName(fullName, email).lastName;
+
+    await database.collection("users").updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          firstName: nextFirst,
+          lastName: nextLast,
+          username: nextUsername,
+          status: "active",
+          verified: true,
+          provider: user.provider || "local",
+          googleId,
+          googleLinkedAt: now,
+          picture: googleProfile.picture || user.picture || "",
+          updatedAt: now,
+        },
+      }
+    );
+
+    user = await database.collection("users").findOne({ _id: user._id });
+  } else {
+    const { firstName, lastName } = splitGoogleName(fullName, email);
+    const username = await generateUniqueUsername(database, fullName.replace(/\s+/g, ""), email);
+    const userId = `u${Date.now()}`;
+
+    await database.collection("users").insertOne({
+      _id: userId,
+      firstName,
+      lastName,
+      username,
+      email,
+      password: null,
+      role: "client",
+      status: "active",
+      verified: true,
+      provider: "google",
+      googleId,
+      picture: googleProfile.picture || "",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    user = await database.collection("users").findOne({ _id: userId });
+  }
+
+  const userId = String(user?._id || "");
+  await database.collection("wallets").updateOne(
+    { userId },
+    {
+      $setOnInsert: { userId, currency: "USD", balance: 0 },
+      $set: { updatedAt: now },
+    },
+    { upsert: true }
+  );
+
+  const wallet = await database.collection("wallets").findOne({ userId });
+
+  return {
+    id: userId,
+    firstName: user.firstName || "",
+    lastName: user.lastName || "",
+    username: user.username || "",
+    email: user.email || "",
+    verified: true,
+    balance: Number(wallet?.balance || 0),
+  };
 }
 
 function generateSixDigitCode() {
@@ -334,9 +522,54 @@ function toObjectId(id) {
   return new ObjectId(id);
 }
 
+function parseCookies(req) {
+  const raw = String(req.get("cookie") || "");
+  if (!raw) {
+    return {};
+  }
+
+  return raw.split(";").reduce((acc, pair) => {
+    const idx = pair.indexOf("=");
+    if (idx < 0) {
+      return acc;
+    }
+    const key = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!key) {
+      return acc;
+    }
+    acc[key] = decodeURIComponent(value || "");
+    return acc;
+  }, {});
+}
+
+function buildCookieOptions(maxAgeMs) {
+  const options = [
+    "Path=/",
+    "HttpOnly",
+    `Max-Age=${Math.floor(Number(maxAgeMs || 0) / 1000)}`,
+    IS_PRODUCTION ? "Secure" : "",
+    IS_PRODUCTION ? "SameSite=None" : "SameSite=Lax",
+    COOKIE_DOMAIN ? `Domain=${COOKIE_DOMAIN}` : "",
+  ].filter(Boolean);
+  return options.join("; ");
+}
+
+function setSessionCookie(res, name, value, maxAgeMs) {
+  const encoded = encodeURIComponent(String(value || ""));
+  res.setHeader("Set-Cookie", `${name}=${encoded}; ${buildCookieOptions(maxAgeMs)}`);
+}
+
+function clearSessionCookie(res, name) {
+  const options = ["Path=/", "HttpOnly", "Max-Age=0", IS_PRODUCTION ? "Secure" : "", IS_PRODUCTION ? "SameSite=None" : "SameSite=Lax", COOKIE_DOMAIN ? `Domain=${COOKIE_DOMAIN}` : ""].filter(Boolean);
+  res.setHeader("Set-Cookie", `${name}=; ${options.join("; ")}`);
+}
+
 async function getAdminFromToken(req) {
   const authHeader = req.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const cookieToken = String(parseCookies(req)[ADMIN_COOKIE_NAME] || "").trim();
+  const token = bearerToken || cookieToken;
   if (!token) {
     return null;
   }
@@ -372,6 +605,40 @@ async function requireAdmin(req, res, next) {
     console.error("admin-auth-error", error);
     return res.status(401).json({ error: "Admin authentication failed" });
   }
+}
+
+async function getUserFromSession(req) {
+  const token = String(parseCookies(req)[USER_COOKIE_NAME] || "").trim();
+  if (!token) {
+    return null;
+  }
+
+  const currentSession = userSessions.get(token);
+  if (!currentSession || currentSession.expiresAt < Date.now()) {
+    userSessions.delete(token);
+    return null;
+  }
+
+  const database = await getDb();
+  const user = await database.collection("users").findOne({ _id: currentSession.userId });
+  if (!user || user.status !== "active") {
+    userSessions.delete(token);
+    return null;
+  }
+
+  const wallet = await database.collection("wallets").findOne({ userId: String(user._id) });
+  return {
+    token,
+    user: {
+      id: String(user._id),
+      firstName: user.firstName || "",
+      lastName: user.lastName || "",
+      username: user.username || "",
+      email: user.email || "",
+      verified: true,
+      balance: Number(wallet?.balance || 0),
+    },
+  };
 }
 
 function resolveWebhookBaseUrl(req) {
@@ -531,6 +798,9 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const wallet = await database.collection("wallets").findOne({ userId: String(user._id) });
+    const sessionToken = crypto.randomBytes(24).toString("hex");
+    userSessions.set(sessionToken, { userId: String(user._id), expiresAt: Date.now() + USER_SESSION_TTL_MS });
+    setSessionCookie(res, USER_COOKIE_NAME, sessionToken, USER_SESSION_TTL_MS);
 
     return res.json({
       ok: true,
@@ -547,6 +817,118 @@ app.post("/api/auth/login", async (req, res) => {
   } catch (error) {
     console.error("auth-login-error", error);
     return res.status(500).json({ error: "Could not sign in" });
+  }
+});
+
+app.get("/api/auth/me", async (req, res) => {
+  try {
+    const session = await getUserFromSession(req);
+    if (!session) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    return res.json({ ok: true, user: session.user });
+  } catch (error) {
+    console.error("auth-me-error", error);
+    return res.status(500).json({ error: "Could not validate session" });
+  }
+});
+
+app.post("/api/auth/logout", async (req, res) => {
+  const token = String(parseCookies(req)[USER_COOKIE_NAME] || "").trim();
+  if (token) {
+    userSessions.delete(token);
+  }
+  clearSessionCookie(res, USER_COOKIE_NAME);
+  return res.json({ ok: true });
+});
+
+app.get("/api/auth/google/start", (req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(500).json({ error: "Google OAuth is not configured" });
+  }
+
+  const state = crypto.randomBytes(20).toString("hex");
+  googleOauthStates.set(state, { createdAt: Date.now() });
+
+  const redirectUri = getGoogleRedirectUri(req);
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "openid email profile",
+    state,
+    access_type: "online",
+    include_granted_scopes: "true",
+    prompt: "select_account",
+  });
+
+  return res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  const frontendErrorRedirect = (reason) => {
+    const redirectUrl = buildFrontendRedirect(FRONTEND_BASE_URL, `googleAuthError=${encodeURIComponent(reason)}`);
+    return res.redirect(redirectUrl);
+  };
+
+  try {
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return frontendErrorRedirect("Google OAuth is not configured");
+    }
+
+    const code = String(req.query?.code || "");
+    const state = String(req.query?.state || "");
+
+    if (!code || !state) {
+      return frontendErrorRedirect("Missing Google OAuth parameters");
+    }
+
+    const currentState = googleOauthStates.get(state);
+    googleOauthStates.delete(state);
+    if (!currentState || Date.now() - Number(currentState.createdAt || 0) > GOOGLE_OAUTH_STATE_TTL_MS) {
+      return frontendErrorRedirect("Google session expired. Please try again.");
+    }
+
+    const redirectUri = getGoogleRedirectUri(req);
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: "authorization_code",
+      }),
+    });
+
+    const tokenData = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok || !tokenData.access_token) {
+      return frontendErrorRedirect("Could not validate Google login");
+    }
+
+    const profileResponse = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+      },
+    });
+    const googleProfile = await profileResponse.json().catch(() => ({}));
+
+    if (!profileResponse.ok || !googleProfile?.email || googleProfile.email_verified !== true) {
+      return frontendErrorRedirect("Google account email is not verified");
+    }
+
+    const database = await getDb();
+    const user = await upsertGoogleUser({ database, googleProfile });
+    const sessionToken = crypto.randomBytes(24).toString("hex");
+    userSessions.set(sessionToken, { userId: String(user.id), expiresAt: Date.now() + USER_SESSION_TTL_MS });
+    setSessionCookie(res, USER_COOKIE_NAME, sessionToken, USER_SESSION_TTL_MS);
+    const payload = encodeBase64UrlJson({ ok: true, user });
+    const redirectUrl = buildFrontendRedirect(FRONTEND_BASE_URL, `googleAuth=${encodeURIComponent(payload)}`);
+    return res.redirect(redirectUrl);
+  } catch (error) {
+    console.error("google-auth-callback-error", error);
+    return frontendErrorRedirect("Google login failed");
   }
 });
 
@@ -652,6 +1034,7 @@ app.post("/api/admin/login", async (req, res) => {
     const token = crypto.randomBytes(24).toString("hex");
     const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
     adminSessions.set(token, { adminId: admin._id, expiresAt });
+    setSessionCookie(res, ADMIN_COOKIE_NAME, token, ADMIN_SESSION_TTL_MS);
 
     return res.json({
       ok: true,
@@ -673,6 +1056,7 @@ app.post("/api/admin/login", async (req, res) => {
 
 app.post("/api/admin/logout", requireAdmin, (req, res) => {
   adminSessions.delete(req.adminSession.token);
+  clearSessionCookie(res, ADMIN_COOKIE_NAME);
   return res.json({ ok: true });
 });
 
