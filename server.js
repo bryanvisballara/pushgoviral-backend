@@ -667,6 +667,27 @@ async function creditWalletBalance(database, userId, amountUsd) {
   );
 }
 
+async function debitWalletBalance(database, userId, amountUsd) {
+  const numericAmount = Number(amountUsd || 0);
+  if (!userId || !Number.isFinite(numericAmount) || numericAmount <= 0) {
+    return null;
+  }
+
+  const result = await database.collection("wallets").findOneAndUpdate(
+    {
+      userId: String(userId),
+      balance: { $gte: numericAmount },
+    },
+    {
+      $inc: { balance: -numericAmount },
+      $set: { updatedAt: new Date() },
+    },
+    { returnDocument: "after" }
+  );
+
+  return getUpdatedDocument(result);
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -1564,12 +1585,20 @@ app.post("/api/payments/mercadopago/webhook", async (req, res) => {
           const resolvedUserId = metadataUserId || String(tx?.userId || "");
 
           if (paymentStatus === "approved" && resolvedUserId && creditedAmountUsd > 0) {
-            if (!tx?.creditedAt) {
+            const creditClaim = await database.collection("wallet_transactions").findOneAndUpdate(
+              {
+                _id: externalRef,
+                $or: [{ creditedAt: { $exists: false } }, { creditedAt: null }],
+              },
+              {
+                $set: { creditedAt: new Date(), updatedAt: new Date() },
+              },
+              { returnDocument: "before" }
+            );
+
+            const claimedTransaction = getUpdatedDocument(creditClaim);
+            if (claimedTransaction) {
               await creditWalletBalance(database, resolvedUserId, creditedAmountUsd);
-              await database.collection("wallet_transactions").updateOne(
-                { _id: externalRef },
-                { $set: { creditedAt: new Date() } }
-              );
             }
           }
         }
@@ -1622,7 +1651,34 @@ app.post("/api/orders/create", async (req, res) => {
     };
 
     const database = await getDb();
-    const result = await database.collection("orders").insertOne(order);
+    const debitedWallet = await debitWalletBalance(database, order.userId, charge);
+    if (!debitedWallet) {
+      return res.status(409).json({ error: "Insufficient wallet balance" });
+    }
+
+    let result;
+    try {
+      result = await database.collection("orders").insertOne(order);
+    } catch (insertError) {
+      await creditWalletBalance(database, order.userId, charge).catch((refundError) => {
+        console.error("order-wallet-refund-error", refundError);
+      });
+      throw insertError;
+    }
+
+    database.collection("wallet_transactions").insertOne({
+      _id: `ord_${order.orderNumber}`,
+      provider: "internal",
+      type: "order_debit",
+      status: "completed",
+      userId: String(order.userId),
+      orderId: String(result.insertedId),
+      amountUsd: charge,
+      createdAt: now,
+      updatedAt: now,
+    }).catch((walletTxError) => {
+      console.error("order-wallet-transaction-error", walletTxError);
+    });
 
     try {
       const user = await database.collection("users").findOne({ _id: String(order.userId) });
@@ -1637,6 +1693,7 @@ app.post("/api/orders/create", async (req, res) => {
         ...order,
         _id: String(result.insertedId),
       },
+      walletBalanceUsd: Number(debitedWallet.balance || 0),
     });
   } catch (error) {
     console.error("create-order-error", error);
