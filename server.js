@@ -58,6 +58,21 @@ const adminSessions = new Map();
 const userSessions = new Map();
 const googleOauthStates = new Map();
 
+const DEFAULT_SERVICE_QUANTITY_LIMITS = {
+  instagram_followers: { minQuantity: 100, maxQuantity: 1000000 },
+  instagram_likes: { minQuantity: 100, maxQuantity: 1000000 },
+  instagram_reel_views: { minQuantity: 500, maxQuantity: 2000000 },
+  instagram_shares: { minQuantity: 100, maxQuantity: 1000000 },
+  instagram_saves: { minQuantity: 10, maxQuantity: 30000 },
+  instagram_repost: { minQuantity: 5, maxQuantity: 50 },
+  instagram_stories_views: { minQuantity: 500, maxQuantity: 2000000 },
+  tiktok_followers: { minQuantity: 100, maxQuantity: 5000000 },
+  tiktok_likes: { minQuantity: 100, maxQuantity: 1000000 },
+  tiktok_video_views: { minQuantity: 100, maxQuantity: 2000000 },
+  tiktok_shares: { minQuantity: 10, maxQuantity: 100000 },
+  tiktok_saves: { minQuantity: 10, maxQuantity: 2000000 },
+};
+
 function buildMongoUri() {
   if (process.env.MONGODB_URI) {
     return process.env.MONGODB_URI;
@@ -140,6 +155,28 @@ function normalizeServiceKeyBase(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
+}
+
+function normalizeQuantityLimit(value) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return NaN;
+  }
+  return Math.floor(normalized);
+}
+
+function getServiceQuantityLimits(service) {
+  const fallback = DEFAULT_SERVICE_QUANTITY_LIMITS[String(service?.key || "").trim()] || null;
+  const fallbackMin = Number(fallback?.minQuantity || 1);
+  const fallbackMax = Number(fallback?.maxQuantity || 0);
+  const storedMin = normalizeQuantityLimit(service?.minQuantity);
+  const storedMax = normalizeQuantityLimit(service?.maxQuantity);
+  const minQuantity = Number.isFinite(storedMin) ? storedMin : fallbackMin;
+  const maxQuantity = Number.isFinite(storedMax) && storedMax >= minQuantity
+    ? storedMax
+    : (fallbackMax >= minQuantity ? fallbackMax : minQuantity);
+
+  return { minQuantity, maxQuantity };
 }
 
 async function generateUniqueServiceKey(database, label) {
@@ -1208,6 +1245,7 @@ app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
         _id: String(item._id),
         costPerUnitUsd: Number(item.costPerUnitUsd || 0),
         unitPriceUsd: Number(item.unitPriceUsd || 0),
+        ...getServiceQuantityLimits(item),
       })),
     });
   } catch (error) {
@@ -1231,6 +1269,7 @@ app.get("/api/public/service-prices", async (_req, res) => {
         key: String(item.key || ""),
         label: String(item.label || ""),
         unitPriceUsd: Number(item.unitPriceUsd || 0),
+        ...getServiceQuantityLimits(item),
       })),
     });
   } catch (error) {
@@ -1245,6 +1284,8 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
     const label = normalizeServiceLabel(req.body?.label);
     const unitPriceUsd = Number(req.body?.unitPriceUsd);
     const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
+    const minQuantity = normalizeQuantityLimit(req.body?.minQuantity);
+    const maxQuantity = normalizeQuantityLimit(req.body?.maxQuantity);
 
     if (
       !key
@@ -1253,8 +1294,11 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
       || unitPriceUsd < 0
       || !Number.isFinite(costPerUnitUsd)
       || costPerUnitUsd < 0
+      || !Number.isFinite(minQuantity)
+      || !Number.isFinite(maxQuantity)
+      || maxQuantity < minQuantity
     ) {
-      return res.status(400).json({ error: "label, unitPriceUsd and costPerUnitUsd are required" });
+      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity and maxQuantity are required" });
     }
 
     const database = await getDb();
@@ -1275,6 +1319,8 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
           label,
           unitPriceUsd,
           costPerUnitUsd,
+          minQuantity,
+          maxQuantity,
           updatedAt: new Date(),
         },
       },
@@ -1299,9 +1345,20 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     const label = normalizeServiceLabel(req.body?.label);
     const unitPriceUsd = Number(req.body?.unitPriceUsd);
     const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
+    const minQuantity = normalizeQuantityLimit(req.body?.minQuantity);
+    const maxQuantity = normalizeQuantityLimit(req.body?.maxQuantity);
 
-    if (!label || !Number.isFinite(unitPriceUsd) || unitPriceUsd < 0 || !Number.isFinite(costPerUnitUsd) || costPerUnitUsd < 0) {
-      return res.status(400).json({ error: "label, unitPriceUsd and costPerUnitUsd are required" });
+    if (
+      !label
+      || !Number.isFinite(unitPriceUsd)
+      || unitPriceUsd < 0
+      || !Number.isFinite(costPerUnitUsd)
+      || costPerUnitUsd < 0
+      || !Number.isFinite(minQuantity)
+      || !Number.isFinite(maxQuantity)
+      || maxQuantity < minQuantity
+    ) {
+      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity and maxQuantity are required" });
     }
 
     const database = await getDb();
@@ -1321,6 +1378,8 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
       label,
       unitPriceUsd,
       costPerUnitUsd,
+      minQuantity,
+      maxQuantity,
       isActive: true,
       createdAt: now,
       updatedAt: now,
@@ -1750,13 +1809,31 @@ app.post("/api/orders/create", async (req, res) => {
       return res.status(400).json({ error: "quantity and chargeUsd are invalid" });
     }
 
+    const database = await getDb();
+    const normalizedService = normalizeServiceLabel(service);
+    const serviceConfig = await database.collection("service_prices").findOne({
+      isActive: { $ne: false },
+      $or: [{ label: normalizedService }, { key: normalizedService }],
+    });
+
+    if (!serviceConfig) {
+      return res.status(400).json({ error: "Service is not available" });
+    }
+
+    const { minQuantity, maxQuantity } = getServiceQuantityLimits(serviceConfig);
+    if (qty < minQuantity || qty > maxQuantity) {
+      return res.status(400).json({
+        error: `Quantity for ${String(serviceConfig.label || normalizedService)} must be between ${minQuantity} and ${maxQuantity}`,
+      });
+    }
+
     const now = new Date();
     const order = {
       userId: String(userId),
       orderNumber: String(Date.now()),
-      service: String(service),
+      service: String(serviceConfig.label || normalizedService),
       platform: String(platform),
-      description: `${String(service)} | ${String(platform)}`,
+      description: `${String(serviceConfig.label || normalizedService)} | ${String(platform)}`,
       link: String(link),
       quantity: qty,
       chargeUsd: charge,
@@ -1765,7 +1842,6 @@ app.post("/api/orders/create", async (req, res) => {
       updatedAt: now,
     };
 
-    const database = await getDb();
     const debitedWallet = await debitWalletBalance(database, order.userId, charge);
     if (!debitedWallet) {
       return res.status(409).json({ error: "Insufficient wallet balance" });
