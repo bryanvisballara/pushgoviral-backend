@@ -103,6 +103,7 @@ async function getDb() {
     await mongo.connect();
     db = mongo.db(MONGODB_DB_NAME);
     await db.collection("orders").createIndex({ userId: 1, createdAt: -1 });
+    await db.collection("service_prices").createIndex({ key: 1 }, { unique: true });
     await db.collection("email_codes").createIndex({ email: 1, purpose: 1, createdAt: -1 });
     await db.collection("email_codes").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   }
@@ -128,6 +129,31 @@ function normalizeUsernameBase(value) {
     .replace(/[^a-z0-9._-]+/g, "")
     .replace(/^[-_.]+|[-_.]+$/g, "");
   return normalized;
+}
+
+function normalizeServiceLabel(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function normalizeServiceKeyBase(value) {
+  return normalizeServiceLabel(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+async function generateUniqueServiceKey(database, label) {
+  const base = normalizeServiceKeyBase(label) || "service";
+
+  for (let i = 0; i < 500; i += 1) {
+    const candidate = i === 0 ? base : `${base}_${i}`;
+    const exists = await database.collection("service_prices").findOne({ key: candidate }, { projection: { _id: 1 } });
+    if (!exists) {
+      return candidate;
+    }
+  }
+
+  return `${base}_${Date.now()}`;
 }
 
 function splitGoogleName(name, email) {
@@ -1190,21 +1216,63 @@ app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
   }
 });
 
+app.get("/api/public/service-prices", async (_req, res) => {
+  try {
+    const database = await getDb();
+    const services = await database
+      .collection("service_prices")
+      .find({ isActive: { $ne: false } })
+      .sort({ label: 1 })
+      .toArray();
+
+    return res.json({
+      ok: true,
+      services: services.map((item) => ({
+        key: String(item.key || ""),
+        label: String(item.label || ""),
+        unitPriceUsd: Number(item.unitPriceUsd || 0),
+      })),
+    });
+  } catch (error) {
+    console.error("public-service-prices-error", error);
+    return res.status(500).json({ error: "Could not fetch service prices" });
+  }
+});
+
 app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
   try {
     const key = String(req.params.key || "").trim();
+    const label = normalizeServiceLabel(req.body?.label);
     const unitPriceUsd = Number(req.body?.unitPriceUsd);
     const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
 
-    if (!key || !Number.isFinite(unitPriceUsd) || unitPriceUsd < 0 || !Number.isFinite(costPerUnitUsd) || costPerUnitUsd < 0) {
-      return res.status(400).json({ error: "key, unitPriceUsd and costPerUnitUsd are required" });
+    if (
+      !key
+      || !label
+      || !Number.isFinite(unitPriceUsd)
+      || unitPriceUsd < 0
+      || !Number.isFinite(costPerUnitUsd)
+      || costPerUnitUsd < 0
+    ) {
+      return res.status(400).json({ error: "label, unitPriceUsd and costPerUnitUsd are required" });
     }
 
     const database = await getDb();
+
+    const duplicateLabel = await database.collection("service_prices").findOne(
+      { key: { $ne: key }, label },
+      { collation: { locale: "en", strength: 2 }, projection: { _id: 1 } }
+    );
+
+    if (duplicateLabel) {
+      return res.status(409).json({ error: "A service with this name already exists" });
+    }
+
     const result = await database.collection("service_prices").findOneAndUpdate(
       { key },
       {
         $set: {
+          label,
           unitPriceUsd,
           costPerUnitUsd,
           updatedAt: new Date(),
@@ -1223,6 +1291,53 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("admin-service-price-update-error", error);
     return res.status(500).json({ error: "Could not update service price" });
+  }
+});
+
+app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
+  try {
+    const label = normalizeServiceLabel(req.body?.label);
+    const unitPriceUsd = Number(req.body?.unitPriceUsd);
+    const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
+
+    if (!label || !Number.isFinite(unitPriceUsd) || unitPriceUsd < 0 || !Number.isFinite(costPerUnitUsd) || costPerUnitUsd < 0) {
+      return res.status(400).json({ error: "label, unitPriceUsd and costPerUnitUsd are required" });
+    }
+
+    const database = await getDb();
+    const existingLabel = await database.collection("service_prices").findOne(
+      { label },
+      { collation: { locale: "en", strength: 2 }, projection: { _id: 1 } }
+    );
+
+    if (existingLabel) {
+      return res.status(409).json({ error: "A service with this name already exists" });
+    }
+
+    const now = new Date();
+    const key = await generateUniqueServiceKey(database, label);
+    const service = {
+      key,
+      label,
+      unitPriceUsd,
+      costPerUnitUsd,
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await database.collection("service_prices").insertOne(service);
+
+    return res.status(201).json({
+      ok: true,
+      service: {
+        ...service,
+        _id: String(result.insertedId),
+      },
+    });
+  } catch (error) {
+    console.error("admin-service-price-create-error", error);
+    return res.status(500).json({ error: "Could not create service" });
   }
 });
 
