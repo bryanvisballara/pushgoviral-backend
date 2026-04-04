@@ -165,6 +165,23 @@ function normalizeQuantityLimit(value) {
   return Math.floor(normalized);
 }
 
+function normalizeServiceText(value) {
+  return String(value || "").trim();
+}
+
+function normalizeServiceTextList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => normalizeServiceText(item))
+      .filter(Boolean);
+  }
+
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => normalizeServiceText(item))
+    .filter(Boolean);
+}
+
 function getServiceQuantityLimits(service) {
   const fallback = DEFAULT_SERVICE_QUANTITY_LIMITS[String(service?.key || "").trim()] || null;
   const fallbackMin = Number(fallback?.minQuantity || 1);
@@ -1245,6 +1262,9 @@ app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
         _id: String(item._id),
         costPerUnitUsd: Number(item.costPerUnitUsd || 0),
         unitPriceUsd: Number(item.unitPriceUsd || 0),
+        serviceAlert: normalizeServiceText(item.serviceAlert),
+        serviceDetails: normalizeServiceTextList(item.serviceDetails),
+        serviceNotes: normalizeServiceTextList(item.serviceNotes),
         ...getServiceQuantityLimits(item),
       })),
     });
@@ -1269,6 +1289,9 @@ app.get("/api/public/service-prices", async (_req, res) => {
         key: String(item.key || ""),
         label: String(item.label || ""),
         unitPriceUsd: Number(item.unitPriceUsd || 0),
+        serviceAlert: normalizeServiceText(item.serviceAlert),
+        serviceDetails: normalizeServiceTextList(item.serviceDetails),
+        serviceNotes: normalizeServiceTextList(item.serviceNotes),
         ...getServiceQuantityLimits(item),
       })),
     });
@@ -1286,6 +1309,9 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
     const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
     const minQuantity = normalizeQuantityLimit(req.body?.minQuantity);
     const maxQuantity = normalizeQuantityLimit(req.body?.maxQuantity);
+    const serviceAlert = normalizeServiceText(req.body?.serviceAlert);
+    const serviceDetails = normalizeServiceTextList(req.body?.serviceDetails);
+    const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
 
     if (
       !key
@@ -1321,6 +1347,9 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
           costPerUnitUsd,
           minQuantity,
           maxQuantity,
+          serviceAlert,
+          serviceDetails,
+          serviceNotes,
           updatedAt: new Date(),
         },
       },
@@ -1347,6 +1376,9 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     const costPerUnitUsd = Number(req.body?.costPerUnitUsd);
     const minQuantity = normalizeQuantityLimit(req.body?.minQuantity);
     const maxQuantity = normalizeQuantityLimit(req.body?.maxQuantity);
+    const serviceAlert = normalizeServiceText(req.body?.serviceAlert);
+    const serviceDetails = normalizeServiceTextList(req.body?.serviceDetails);
+    const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
 
     if (
       !label
@@ -1380,6 +1412,9 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
       costPerUnitUsd,
       minQuantity,
       maxQuantity,
+      serviceAlert,
+      serviceDetails,
+      serviceNotes,
       isActive: true,
       createdAt: now,
       updatedAt: now,
