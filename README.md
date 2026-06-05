@@ -45,8 +45,27 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `GET /api/admin/orders?status=pending|completed|all`
 - `PATCH /api/admin/orders/:id/complete`
 - `GET /api/admin/service-prices`
+- `POST /api/admin/service-prices`
 - `PUT /api/admin/service-prices/:key`
+- `GET /api/admin/catalog-options?category=instagram`
+- `PUT /api/admin/catalog-options/:category`
+- `GET /api/public/service-categories`
+- `GET /api/public/service-prices`
 - `GET /api/admin/overview`
+
+## MongoDB collections
+
+- `service_prices` — each quality variant is one document (`category`, `serviceType`, `qualityTier`, pricing, alerts, details, notes)
+- `catalog_options` — per-platform service type and quality tier catalogs (`category`, `serviceTypes[]`, `qualityTiers[]`)
+- `orders`, `users`, `wallets`, `wallet_transactions`, `admin_users`, `email_codes`, `mp_webhooks`, `app_settings`
+
+On startup the API creates indexes and backfills missing `category`, `serviceType`, `qualityTier`, and `catalog_options` data from existing services.
+
+Manual catalog sync:
+
+```bash
+npm run sync:catalog
+```
 
 ## Admin Seed
 

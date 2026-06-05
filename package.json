@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "seed:admin": "node scripts/seed-admin.js"
+    "seed:admin": "node scripts/seed-admin.js",
+    "sync:catalog": "node scripts/sync-catalog-options.mjs"
   },
   "engines": {
     "node": ">=18"

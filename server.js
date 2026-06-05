@@ -3,6 +3,28 @@ const cors = require("cors");
 const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 const { renderVerificationEmail, renderPasswordResetEmail } = require("./email-templates/codes");
+const {
+  CATEGORY_IDS,
+  inferServiceCategory,
+  normalizeServiceCategory,
+  getPublicServiceCategories,
+} = require("./service-categories");
+const {
+  resolveServiceMeta,
+  normalizeServiceType,
+  normalizeQualityTier,
+  getPublicServiceTypes,
+  getPublicQualityTiers,
+  slugifyCatalogId,
+  getServiceTypeLabel,
+  getQualityLabel,
+} = require("./service-catalog-meta");
+const {
+  getCatalogOptionsForCategory,
+  saveCatalogOptionsForCategory,
+  registerCatalogEntriesFromService,
+  backfillCatalogOptions,
+} = require("./catalog-options");
 
 require("dotenv").config();
 
@@ -119,10 +141,216 @@ async function getDb() {
     db = mongo.db(MONGODB_DB_NAME);
     await db.collection("orders").createIndex({ userId: 1, createdAt: -1 });
     await db.collection("service_prices").createIndex({ key: 1 }, { unique: true });
+    await db.collection("service_prices").createIndex({ category: 1, label: 1 });
+    await db.collection("service_prices").createIndex({ category: 1, serviceType: 1, qualityTier: 1 });
+    await db.collection("catalog_options").createIndex({ category: 1 }, { unique: true });
     await db.collection("email_codes").createIndex({ email: 1, purpose: 1, createdAt: -1 });
     await db.collection("email_codes").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await backfillServiceCategories(db);
+    await backfillServiceCatalogMeta(db);
+    const catalogBackfill = await backfillCatalogOptions(db);
+    if (catalogBackfill.categoriesProcessed > 0) {
+      console.log(`catalog-options-backfill: synced ${catalogBackfill.categoriesProcessed} categories`);
+    }
   }
   return db;
+}
+
+async function backfillServiceCatalogMeta(database) {
+  const services = await database
+    .collection("service_prices")
+    .find({
+      $or: [
+        { serviceType: { $exists: false } },
+        { serviceType: "" },
+        { serviceType: null },
+        { qualityTier: { $exists: false } },
+        { qualityTier: "" },
+        { qualityTier: null },
+      ],
+    })
+    .project({ key: 1, label: 1, category: 1, serviceType: 1, qualityTier: 1, serviceTypeLabel: 1, qualityLabel: 1 })
+    .toArray();
+
+  if (!services.length) {
+    return;
+  }
+
+  await Promise.all(
+    services.map((service) => {
+      const category = normalizeServiceCategory(service.category, service.key, service.label);
+      const meta = resolveServiceMeta({ ...service, category }, category);
+      return database.collection("service_prices").updateOne(
+        { _id: service._id },
+        {
+          $set: {
+            serviceType: meta.serviceType,
+            serviceTypeLabel: meta.serviceTypeLabel,
+            qualityTier: meta.qualityTier,
+            qualityLabel: meta.qualityLabel,
+            updatedAt: new Date(),
+          },
+        }
+      );
+    })
+  );
+}
+
+function resolveStoredServiceMeta(body, key, label, category) {
+  const normalizedCategory = normalizeServiceCategory(category, key, label);
+  const serviceTypeLabel = String(body?.serviceTypeLabel || "").trim();
+  const qualityLabel = String(body?.qualityLabel || "").trim();
+  const serviceType = normalizeServiceType(body?.serviceType, key, label, normalizedCategory, serviceTypeLabel);
+  const qualityTier = normalizeQualityTier(body?.qualityTier, key, label, qualityLabel);
+
+  if (!serviceType || !qualityTier) {
+    return null;
+  }
+
+  return {
+    serviceType,
+    serviceTypeLabel: serviceTypeLabel || getServiceTypeLabel(serviceType),
+    qualityTier,
+    qualityLabel: qualityLabel || getQualityLabel(qualityTier),
+  };
+}
+
+async function backfillServiceCategories(database) {
+  const services = await database
+    .collection("service_prices")
+    .find({ $or: [{ category: { $exists: false } }, { category: "" }, { category: null }] })
+    .project({ key: 1, label: 1 })
+    .toArray();
+
+  if (!services.length) {
+    return;
+  }
+
+  await Promise.all(
+    services.map((service) => {
+      const category = inferServiceCategory(service.key, service.label);
+      return database.collection("service_prices").updateOne(
+        { _id: service._id },
+        { $set: { category, updatedAt: new Date() } }
+      );
+    })
+  );
+}
+
+function mapServiceDocument(item) {
+  const category = normalizeServiceCategory(item.category, item.key, item.label);
+  const meta = resolveServiceMeta({ ...item, category }, category);
+  return {
+    ...item,
+    _id: String(item._id),
+    category,
+    serviceType: meta.serviceType,
+    serviceTypeLabel: meta.serviceTypeLabel,
+    qualityTier: meta.qualityTier,
+    qualityLabel: meta.qualityLabel,
+    costPerUnitUsd: Number(item.costPerUnitUsd || 0),
+    unitPriceUsd: Number(item.unitPriceUsd || 0),
+    serviceAlert: normalizeServiceText(item.serviceAlert),
+    serviceDetails: normalizeServiceTextList(item.serviceDetails),
+    serviceNotes: normalizeServiceTextList(item.serviceNotes),
+    ...getServiceQuantityLimits(item),
+  };
+}
+
+function buildUserSearchFilter(queryValue) {
+  const query = String(queryValue || "").trim();
+  if (!query) {
+    return {};
+  }
+
+  const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  return {
+    $or: [
+      { firstName: regex },
+      { lastName: regex },
+      { username: regex },
+      { email: regex },
+      { _id: regex },
+    ],
+  };
+}
+
+function buildOrderSearchStages(status, queryParams = {}) {
+  const filter = status === "all" ? {} : { status };
+  const query = String(queryParams.q || "").trim();
+  const userId = String(queryParams.userId || "").trim();
+  const service = String(queryParams.service || "").trim();
+  const dateFrom = queryParams.dateFrom ? new Date(String(queryParams.dateFrom)) : null;
+  const dateTo = queryParams.dateTo ? new Date(String(queryParams.dateTo)) : null;
+
+  if (userId) {
+    filter.userId = userId;
+  }
+
+  if (service) {
+    filter.service = new RegExp(service.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  }
+
+  if (dateFrom && !Number.isNaN(dateFrom.getTime())) {
+    filter.createdAt = { ...(filter.createdAt || {}), $gte: dateFrom };
+  }
+
+  if (dateTo && !Number.isNaN(dateTo.getTime())) {
+    const end = new Date(dateTo);
+    end.setHours(23, 59, 59, 999);
+    filter.createdAt = { ...(filter.createdAt || {}), $lte: end };
+  }
+
+  const stages = [
+    { $match: filter },
+    {
+      $lookup: {
+        from: "users",
+        localField: "userId",
+        foreignField: "_id",
+        as: "userDocs",
+      },
+    },
+    {
+      $addFields: {
+        userFirstName: { $ifNull: [{ $arrayElemAt: ["$userDocs.firstName", 0] }, ""] },
+        userLastName: { $ifNull: [{ $arrayElemAt: ["$userDocs.lastName", 0] }, ""] },
+        userUsername: { $ifNull: [{ $arrayElemAt: ["$userDocs.username", 0] }, ""] },
+        userEmail: { $ifNull: [{ $arrayElemAt: ["$userDocs.email", 0] }, ""] },
+      },
+    },
+    {
+      $addFields: {
+        userDisplayName: {
+          $trim: {
+            input: {
+              $concat: ["$userFirstName", " ", "$userLastName"],
+            },
+          },
+        },
+      },
+    },
+  ];
+
+  if (query) {
+    const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    stages.push({
+      $match: {
+        $or: [
+          { orderNumber: regex },
+          { _id: regex },
+          { userId: regex },
+          { service: regex },
+          { userDisplayName: regex },
+          { userUsername: regex },
+          { userEmail: regex },
+        ],
+      },
+    });
+  }
+
+  stages.push({ $sort: { createdAt: -1 } }, { $limit: 500 });
+  return stages;
 }
 
 function normalizeEmail(value) {
@@ -1165,36 +1393,61 @@ app.get("/api/admin/me", requireAdmin, (req, res) => {
   return res.json({ ok: true, admin: req.adminSession.admin });
 });
 
-app.get("/api/admin/users", requireAdmin, async (_req, res) => {
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
     const database = await getDb();
-    const users = await database
-      .collection("users")
-      .aggregate([
-        {
-          $lookup: {
-            from: "wallets",
-            localField: "_id",
-            foreignField: "userId",
-            as: "wallet",
-          },
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const minBalance = Number(req.query?.minBalance);
+    const maxBalance = Number(req.query?.maxBalance);
+    const searchFilter = buildUserSearchFilter(req.query?.q);
+
+    const matchStages = [];
+    if (Object.keys(searchFilter).length) {
+      matchStages.push({ $match: searchFilter });
+    }
+    if (status) {
+      matchStages.push({ $match: { status } });
+    }
+
+    const pipeline = [
+      ...matchStages,
+      {
+        $lookup: {
+          from: "wallets",
+          localField: "_id",
+          foreignField: "userId",
+          as: "wallet",
         },
-        {
-          $project: {
-            _id: 1,
-            firstName: 1,
-            lastName: 1,
-            username: 1,
-            email: 1,
-            role: 1,
-            status: 1,
-            createdAt: 1,
-            balanceUsd: { $ifNull: [{ $arrayElemAt: ["$wallet.balance", 0] }, 0] },
-          },
+      },
+      {
+        $project: {
+          _id: 1,
+          firstName: 1,
+          lastName: 1,
+          username: 1,
+          email: 1,
+          role: 1,
+          status: 1,
+          createdAt: 1,
+          balanceUsd: { $ifNull: [{ $arrayElemAt: ["$wallet.balance", 0] }, 0] },
         },
-        { $sort: { createdAt: -1, _id: 1 } },
-      ])
-      .toArray();
+      },
+    ];
+
+    const balanceFilters = {};
+    if (Number.isFinite(minBalance)) {
+      balanceFilters.$gte = minBalance;
+    }
+    if (Number.isFinite(maxBalance)) {
+      balanceFilters.$lte = maxBalance;
+    }
+    if (Object.keys(balanceFilters).length) {
+      pipeline.push({ $match: { balanceUsd: balanceFilters } });
+    }
+
+    pipeline.push({ $sort: { createdAt: -1, _id: 1 } });
+
+    const users = await database.collection("users").aggregate(pipeline).toArray();
 
     return res.json({ ok: true, users });
   } catch (error) {
@@ -1211,13 +1464,19 @@ app.get("/api/admin/orders", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "Invalid status filter" });
     }
 
-    const filter = status === "all" ? {} : { status };
     const database = await getDb();
-    const orders = await database.collection("orders").find(filter).sort({ createdAt: -1 }).limit(500).toArray();
+    const pipeline = buildOrderSearchStages(status, req.query || {});
+    const orders = await database.collection("orders").aggregate(pipeline).toArray();
 
     return res.json({
       ok: true,
-      orders: orders.map((item) => ({ ...item, _id: String(item._id) })),
+      orders: orders.map((item) => ({
+        ...item,
+        _id: String(item._id),
+        userName: String(item.userDisplayName || "").trim() || String(item.userUsername || "").trim() || "-",
+        userEmail: item.userEmail || "",
+        userUsername: item.userUsername || "",
+      })),
     });
   } catch (error) {
     console.error("admin-orders-error", error);
@@ -1254,23 +1513,49 @@ app.patch("/api/admin/orders/:id/complete", requireAdmin, async (req, res) => {
 app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
   try {
     const database = await getDb();
-    const services = await database.collection("service_prices").find({}).sort({ label: 1 }).toArray();
+    const services = await database.collection("service_prices").find({}).sort({ category: 1, label: 1 }).toArray();
     return res.json({
       ok: true,
-      services: services.map((item) => ({
-        ...item,
-        _id: String(item._id),
-        costPerUnitUsd: Number(item.costPerUnitUsd || 0),
-        unitPriceUsd: Number(item.unitPriceUsd || 0),
-        serviceAlert: normalizeServiceText(item.serviceAlert),
-        serviceDetails: normalizeServiceTextList(item.serviceDetails),
-        serviceNotes: normalizeServiceTextList(item.serviceNotes),
-        ...getServiceQuantityLimits(item),
-      })),
+      categories: getPublicServiceCategories(),
+      serviceTypes: getPublicServiceTypes(),
+      qualityTiers: getPublicQualityTiers(),
+      services: services.map((item) => mapServiceDocument(item)),
     });
   } catch (error) {
     console.error("admin-service-prices-error", error);
     return res.status(500).json({ error: "Could not fetch service prices" });
+  }
+});
+
+app.get("/api/public/service-categories", async (_req, res) => {
+  return res.json({ ok: true, categories: getPublicServiceCategories() });
+});
+
+app.get("/api/admin/catalog-options", requireAdmin, async (req, res) => {
+  try {
+    const category = String(req.query?.category || "").trim().toLowerCase();
+    if (!category) {
+      return res.status(400).json({ error: "category is required" });
+    }
+
+    const database = await getDb();
+    const options = await getCatalogOptionsForCategory(database, category);
+    return res.json({ ok: true, options });
+  } catch (error) {
+    console.error("admin-catalog-options-get-error", error);
+    return res.status(500).json({ error: "Could not fetch catalog options" });
+  }
+});
+
+app.put("/api/admin/catalog-options/:category", requireAdmin, async (req, res) => {
+  try {
+    const category = String(req.params.category || "").trim().toLowerCase();
+    const database = await getDb();
+    const options = await saveCatalogOptionsForCategory(database, category, req.body || {});
+    return res.json({ ok: true, options });
+  } catch (error) {
+    console.error("admin-catalog-options-save-error", error);
+    return res.status(400).json({ error: error.message || "Could not save catalog options" });
   }
 });
 
@@ -1280,20 +1565,32 @@ app.get("/api/public/service-prices", async (_req, res) => {
     const services = await database
       .collection("service_prices")
       .find({ isActive: { $ne: false } })
-      .sort({ label: 1 })
+      .sort({ category: 1, label: 1 })
       .toArray();
 
     return res.json({
       ok: true,
-      services: services.map((item) => ({
-        key: String(item.key || ""),
-        label: String(item.label || ""),
-        unitPriceUsd: Number(item.unitPriceUsd || 0),
-        serviceAlert: normalizeServiceText(item.serviceAlert),
-        serviceDetails: normalizeServiceTextList(item.serviceDetails),
-        serviceNotes: normalizeServiceTextList(item.serviceNotes),
-        ...getServiceQuantityLimits(item),
-      })),
+      categories: getPublicServiceCategories(),
+      serviceTypes: getPublicServiceTypes(),
+      qualityTiers: getPublicQualityTiers(),
+      services: services.map((item) => {
+        const mapped = mapServiceDocument(item);
+        return {
+          key: String(mapped.key || ""),
+          label: String(mapped.label || ""),
+          category: mapped.category,
+          serviceType: mapped.serviceType,
+          serviceTypeLabel: mapped.serviceTypeLabel,
+          qualityTier: mapped.qualityTier,
+          qualityLabel: mapped.qualityLabel,
+          unitPriceUsd: mapped.unitPriceUsd,
+          serviceAlert: mapped.serviceAlert,
+          serviceDetails: mapped.serviceDetails,
+          serviceNotes: mapped.serviceNotes,
+          minQuantity: mapped.minQuantity,
+          maxQuantity: mapped.maxQuantity,
+        };
+      }),
     });
   } catch (error) {
     console.error("public-service-prices-error", error);
@@ -1312,6 +1609,8 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
     const serviceAlert = normalizeServiceText(req.body?.serviceAlert);
     const serviceDetails = normalizeServiceTextList(req.body?.serviceDetails);
     const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
+    const category = normalizeServiceCategory(req.body?.category, key, label);
+    const serviceMeta = resolveStoredServiceMeta(req.body, key, label, category);
 
     if (
       !key
@@ -1323,8 +1622,10 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
       || !Number.isFinite(minQuantity)
       || !Number.isFinite(maxQuantity)
       || maxQuantity < minQuantity
+      || !CATEGORY_IDS.has(category)
+      || !serviceMeta
     ) {
-      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity and maxQuantity are required" });
+      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity, maxQuantity, category, serviceType and qualityTier are required" });
     }
 
     const database = await getDb();
@@ -1343,6 +1644,11 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
       {
         $set: {
           label,
+          category,
+          serviceType: serviceMeta.serviceType,
+          serviceTypeLabel: serviceMeta.serviceTypeLabel,
+          qualityTier: serviceMeta.qualityTier,
+          qualityLabel: serviceMeta.qualityLabel,
           unitPriceUsd,
           costPerUnitUsd,
           minQuantity,
@@ -1362,6 +1668,8 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
       return res.status(404).json({ error: "Service not found" });
     }
 
+    await registerCatalogEntriesFromService(database, category, serviceMeta);
+
     return res.json({ ok: true, service: { ...updatedService, _id: String(updatedService._id) } });
   } catch (error) {
     console.error("admin-service-price-update-error", error);
@@ -1379,6 +1687,8 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     const serviceAlert = normalizeServiceText(req.body?.serviceAlert);
     const serviceDetails = normalizeServiceTextList(req.body?.serviceDetails);
     const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
+    const category = normalizeServiceCategory(req.body?.category, "", label);
+    const serviceMeta = resolveStoredServiceMeta(req.body, "", label, category);
 
     if (
       !label
@@ -1389,8 +1699,10 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
       || !Number.isFinite(minQuantity)
       || !Number.isFinite(maxQuantity)
       || maxQuantity < minQuantity
+      || !CATEGORY_IDS.has(category)
+      || !serviceMeta
     ) {
-      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity and maxQuantity are required" });
+      return res.status(400).json({ error: "label, unitPriceUsd, costPerUnitUsd, minQuantity, maxQuantity, category, serviceType and qualityTier are required" });
     }
 
     const database = await getDb();
@@ -1408,6 +1720,11 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     const service = {
       key,
       label,
+      category,
+      serviceType: serviceMeta.serviceType,
+      serviceTypeLabel: serviceMeta.serviceTypeLabel,
+      qualityTier: serviceMeta.qualityTier,
+      qualityLabel: serviceMeta.qualityLabel,
       unitPriceUsd,
       costPerUnitUsd,
       minQuantity,
@@ -1421,6 +1738,8 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     };
 
     const result = await database.collection("service_prices").insertOne(service);
+
+    await registerCatalogEntriesFromService(database, category, serviceMeta);
 
     return res.status(201).json({
       ok: true,
