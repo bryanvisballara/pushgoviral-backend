@@ -56,10 +56,23 @@ async function getCatalogOptionsForCategory(database, category) {
     database.collection("catalog_options").findOne({ category: normalizedCategory }),
     database
       .collection("service_prices")
-      .find({ category: normalizedCategory })
+      .find({ category: normalizedCategory, isActive: { $ne: false } })
       .project({ serviceType: 1, serviceTypeLabel: 1, qualityTier: 1, qualityLabel: 1 })
       .toArray(),
   ]);
+
+  const hasStoredOptions = Array.isArray(stored?.serviceTypes)
+    && stored.serviceTypes.length
+    && Array.isArray(stored?.qualityTiers)
+    && stored.qualityTiers.length;
+
+  if (hasStoredOptions) {
+    return {
+      category: normalizedCategory,
+      serviceTypes: mergeCatalogEntries(stored.serviceTypes),
+      qualityTiers: mergeCatalogEntries(stored.qualityTiers),
+    };
+  }
 
   const serviceTypes = mergeCatalogEntries(
     getPublicServiceTypes(),
@@ -106,7 +119,11 @@ async function saveCatalogOptionsForCategory(database, category, payload) {
     { upsert: true }
   );
 
-  return getCatalogOptionsForCategory(database, normalizedCategory);
+  return {
+    category: normalizedCategory,
+    serviceTypes,
+    qualityTiers,
+  };
 }
 
 async function registerCatalogEntriesFromService(database, category, serviceMeta) {
