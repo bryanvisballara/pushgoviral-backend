@@ -154,6 +154,8 @@ async function getDb() {
     await db.collection("catalog_options").createIndex({ category: 1 }, { unique: true });
     await db.collection("email_codes").createIndex({ email: 1, purpose: 1, createdAt: -1 });
     await db.collection("email_codes").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await db.collection("admin_sessions").createIndex({ token: 1 }, { unique: true });
+    await db.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     await backfillServiceCategories(db);
     await backfillServiceCatalogMeta(db);
     const catalogBackfill = await backfillCatalogOptions(db);
@@ -923,6 +925,46 @@ function clearSessionCookie(res, name) {
   res.setHeader("Set-Cookie", `${name}=; ${options.join("; ")}`);
 }
 
+async function saveAdminSession(database, token, adminId, expiresAtMs) {
+  const expiresAt = new Date(expiresAtMs);
+  await database.collection("admin_sessions").updateOne(
+    { token },
+    {
+      $set: {
+        token,
+        adminId: String(adminId),
+        expiresAt,
+        updatedAt: new Date(),
+      },
+      $setOnInsert: { createdAt: new Date() },
+    },
+    { upsert: true }
+  );
+}
+
+async function loadAdminSession(database, token) {
+  const session = await database.collection("admin_sessions").findOne({
+    token,
+    expiresAt: { $gt: new Date() },
+  });
+  if (!session) {
+    return null;
+  }
+
+  return {
+    adminId: session.adminId,
+    expiresAt: new Date(session.expiresAt).getTime(),
+  };
+}
+
+async function removeAdminSession(database, token) {
+  if (!token) {
+    return;
+  }
+  adminSessions.delete(token);
+  await database.collection("admin_sessions").deleteOne({ token });
+}
+
 async function getAdminFromToken(req) {
   const authHeader = req.get("authorization") || "";
   const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
@@ -932,19 +974,25 @@ async function getAdminFromToken(req) {
     return null;
   }
 
-  const currentSession = adminSessions.get(token);
+  let currentSession = adminSessions.get(token);
+  const database = await getDb();
+
   if (!currentSession || currentSession.expiresAt < Date.now()) {
-    adminSessions.delete(token);
-    return null;
+    const persistedSession = await loadAdminSession(database, token);
+    if (!persistedSession || persistedSession.expiresAt < Date.now()) {
+      adminSessions.delete(token);
+      return null;
+    }
+    currentSession = persistedSession;
+    adminSessions.set(token, currentSession);
   }
 
-  const database = await getDb();
   const admin = await database.collection("admin_users").findOne(
     { _id: currentSession.adminId },
     { projection: { password: 0 } }
   );
   if (!admin || admin.status !== "active") {
-    adminSessions.delete(token);
+    await removeAdminSession(database, token);
     return null;
   }
 
@@ -1413,6 +1461,7 @@ app.post("/api/admin/login", async (req, res) => {
     const token = crypto.randomBytes(24).toString("hex");
     const expiresAt = Date.now() + ADMIN_SESSION_TTL_MS;
     adminSessions.set(token, { adminId: admin._id, expiresAt });
+    await saveAdminSession(database, token, admin._id, expiresAt);
     setSessionCookie(res, ADMIN_COOKIE_NAME, token, ADMIN_SESSION_TTL_MS);
 
     return res.json({
@@ -1433,8 +1482,9 @@ app.post("/api/admin/login", async (req, res) => {
   }
 });
 
-app.post("/api/admin/logout", requireAdmin, (req, res) => {
-  adminSessions.delete(req.adminSession.token);
+app.post("/api/admin/logout", requireAdmin, async (req, res) => {
+  const database = await getDb();
+  await removeAdminSession(database, req.adminSession.token);
   clearSessionCookie(res, ADMIN_COOKIE_NAME);
   return res.json({ ok: true });
 });
