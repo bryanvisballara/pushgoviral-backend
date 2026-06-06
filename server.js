@@ -25,6 +25,12 @@ const {
   registerCatalogEntriesFromService,
   backfillCatalogOptions,
 } = require("./catalog-options");
+const {
+  isMarketFollowersConfigured,
+  listServices,
+  getBalance,
+} = require("./marketfollowers");
+const { tryFulfillOrder, syncProviderOrderStatuses } = require("./order-fulfillment");
 
 require("dotenv").config();
 
@@ -68,6 +74,7 @@ const CODE_RESEND_COOLDOWN_SECONDS = Number(process.env.AUTH_CODE_RESEND_COOLDOW
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const TELEGRAM_THREAD_ID = process.env.TELEGRAM_THREAD_ID || "";
+const PROVIDER_SYNC_INTERVAL_MS = Number(process.env.PROVIDER_SYNC_INTERVAL_MS || 120000);
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_OAUTH_STATE_TTL_MS = Number(process.env.GOOGLE_OAUTH_STATE_TTL_MS || 1000 * 60 * 10);
@@ -140,6 +147,7 @@ async function getDb() {
     await mongo.connect();
     db = mongo.db(MONGODB_DB_NAME);
     await db.collection("orders").createIndex({ userId: 1, createdAt: -1 });
+    await db.collection("orders").createIndex({ fulfillmentProvider: 1, status: 1, providerOrderId: 1 });
     await db.collection("service_prices").createIndex({ key: 1 }, { unique: true });
     await db.collection("service_prices").createIndex({ category: 1, label: 1 });
     await db.collection("service_prices").createIndex({ category: 1, serviceType: 1, qualityTier: 1 });
@@ -237,6 +245,31 @@ async function backfillServiceCategories(database) {
   );
 }
 
+function normalizeProviderFields(body) {
+  const autoFulfillment = Boolean(body?.autoFulfillment);
+  let providerServiceId = body?.providerServiceId;
+
+  if (providerServiceId === "" || providerServiceId === null || providerServiceId === undefined) {
+    providerServiceId = null;
+  } else {
+    providerServiceId = Number(providerServiceId);
+    if (!Number.isFinite(providerServiceId) || providerServiceId <= 0) {
+      providerServiceId = null;
+    }
+  }
+
+  const providerServiceName = normalizeServiceText(body?.providerServiceName || "");
+  const provider = String(body?.provider || "marketfollowers").trim().toLowerCase();
+  const enabled = autoFulfillment && providerServiceId;
+
+  return {
+    provider: enabled ? provider : "",
+    autoFulfillment: enabled,
+    providerServiceId: enabled ? providerServiceId : null,
+    providerServiceName: enabled ? providerServiceName : "",
+  };
+}
+
 function mapServiceDocument(item) {
   const category = normalizeServiceCategory(item.category, item.key, item.label);
   const meta = resolveServiceMeta({ ...item, category }, category);
@@ -253,6 +286,12 @@ function mapServiceDocument(item) {
     serviceAlert: normalizeServiceText(item.serviceAlert),
     serviceDetails: normalizeServiceTextList(item.serviceDetails),
     serviceNotes: normalizeServiceTextList(item.serviceNotes),
+    provider: String(item.provider || "").trim(),
+    autoFulfillment: Boolean(item.autoFulfillment),
+    providerServiceId: Number.isFinite(Number(item.providerServiceId)) && Number(item.providerServiceId) > 0
+      ? Number(item.providerServiceId)
+      : null,
+    providerServiceName: normalizeServiceText(item.providerServiceName),
     ...getServiceQuantityLimits(item),
   };
 }
@@ -659,7 +698,7 @@ async function sendTelegramOrderNotification({ order, user }) {
     ? `${escapeTelegramHtml(user.firstName || "")} ${escapeTelegramHtml(user.lastName || "")}`.trim()
     : "Unknown";
 
-  const text = [
+  const messageLines = [
     "<b>New Order - PushGo Viral</b>",
     "",
     `<b>Order Number:</b> ${escapeTelegramHtml(order.orderNumber)}`,
@@ -673,8 +712,19 @@ async function sendTelegramOrderNotification({ order, user }) {
     `<b>Quantity:</b> ${escapeTelegramHtml(order.quantity)}`,
     `<b>Charge USD:</b> ${escapeTelegramHtml(Number(order.chargeUsd || 0).toFixed(2))}`,
     `<b>Status:</b> ${escapeTelegramHtml(order.status)}`,
-    `<b>Created At:</b> ${escapeTelegramHtml(createdAt)}`,
-  ].join("\n");
+  ];
+
+  if (order.providerOrderId) {
+    messageLines.push(`<b>Provider Order:</b> ${escapeTelegramHtml(order.providerOrderId)} (MarketFollowers auto)`);
+  } else if (order.fulfillmentError) {
+    messageLines.push(`<b>Fulfillment:</b> Manual required — ${escapeTelegramHtml(order.fulfillmentError)}`);
+  } else {
+    messageLines.push("<b>Fulfillment:</b> Manual (Telegram)");
+  }
+
+  messageLines.push(`<b>Created At:</b> ${escapeTelegramHtml(createdAt)}`);
+
+  const text = messageLines.join("\n");
 
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
@@ -1513,7 +1563,7 @@ app.patch("/api/admin/orders/:id/complete", requireAdmin, async (req, res) => {
 app.get("/api/admin/service-prices", requireAdmin, async (_req, res) => {
   try {
     const database = await getDb();
-    const services = await database.collection("service_prices").find({}).sort({ category: 1, label: 1 }).toArray();
+    const services = await database.collection("service_prices").find({ isActive: { $ne: false } }).sort({ category: 1, label: 1 }).toArray();
     return res.json({
       ok: true,
       categories: getPublicServiceCategories(),
@@ -1611,6 +1661,7 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
     const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
     const category = normalizeServiceCategory(req.body?.category, key, label);
     const serviceMeta = resolveStoredServiceMeta(req.body, key, label, category);
+    const providerFields = normalizeProviderFields(req.body);
 
     if (
       !key
@@ -1656,6 +1707,7 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
           serviceAlert,
           serviceDetails,
           serviceNotes,
+          ...providerFields,
           updatedAt: new Date(),
         },
       },
@@ -1670,7 +1722,7 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
 
     await registerCatalogEntriesFromService(database, category, serviceMeta);
 
-    return res.json({ ok: true, service: { ...updatedService, _id: String(updatedService._id) } });
+    return res.json({ ok: true, service: mapServiceDocument(updatedService) });
   } catch (error) {
     console.error("admin-service-price-update-error", error);
     return res.status(500).json({ error: "Could not update service price" });
@@ -1689,6 +1741,7 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     const serviceNotes = normalizeServiceTextList(req.body?.serviceNotes);
     const category = normalizeServiceCategory(req.body?.category, "", label);
     const serviceMeta = resolveStoredServiceMeta(req.body, "", label, category);
+    const providerFields = normalizeProviderFields(req.body);
 
     if (
       !label
@@ -1732,6 +1785,7 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
       serviceAlert,
       serviceDetails,
       serviceNotes,
+      ...providerFields,
       isActive: true,
       createdAt: now,
       updatedAt: now,
@@ -1743,14 +1797,108 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
 
     return res.status(201).json({
       ok: true,
-      service: {
-        ...service,
-        _id: String(result.insertedId),
-      },
+      service: mapServiceDocument({ ...service, _id: result.insertedId }),
     });
   } catch (error) {
     console.error("admin-service-price-create-error", error);
     return res.status(500).json({ error: "Could not create service" });
+  }
+});
+
+app.delete("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
+  try {
+    const key = String(req.params.key || "").trim();
+    if (!key) {
+      return res.status(400).json({ error: "Service key is required" });
+    }
+
+    const database = await getDb();
+    const result = await database.collection("service_prices").findOneAndUpdate(
+      { key, isActive: { $ne: false } },
+      { $set: { isActive: false, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+
+    const deletedService = getUpdatedDocument(result);
+    if (!deletedService) {
+      return res.status(404).json({ error: "Service not found" });
+    }
+
+    return res.json({ ok: true, service: mapServiceDocument(deletedService) });
+  } catch (error) {
+    console.error("admin-service-price-delete-error", error);
+    return res.status(500).json({ error: "Could not delete service" });
+  }
+});
+
+app.get("/api/admin/providers/marketfollowers/status", requireAdmin, (_req, res) => {
+  return res.json({
+    ok: true,
+    configured: isMarketFollowersConfigured(),
+    provider: "marketfollowers",
+  });
+});
+
+app.get("/api/admin/providers/marketfollowers/balance", requireAdmin, async (_req, res) => {
+  if (!isMarketFollowersConfigured()) {
+    return res.json({
+      ok: true,
+      configured: false,
+      balance: null,
+      currency: "USD",
+      message: "Set MARKETFOLLOWERS_API_KEY in the backend environment.",
+    });
+  }
+
+  try {
+    const balance = await getBalance();
+    return res.json({ ok: true, configured: true, ...balance });
+  } catch (error) {
+    console.error("marketfollowers-balance-error", error);
+    return res.status(502).json({ ok: false, configured: true, error: error.message || "Could not fetch balance" });
+  }
+});
+
+app.get("/api/admin/providers/marketfollowers/services", requireAdmin, async (req, res) => {
+  if (!isMarketFollowersConfigured()) {
+    return res.json({
+      ok: true,
+      configured: false,
+      services: [],
+      message: "Set MARKETFOLLOWERS_API_KEY in the backend environment.",
+    });
+  }
+
+  try {
+    const query = String(req.query?.q || "").trim().toLowerCase();
+    let services = await listServices();
+
+    if (query) {
+      services = services.filter((item) => {
+        const haystack = `${item.id} ${item.name} ${item.category} ${item.type}`.toLowerCase();
+        return haystack.includes(query);
+      });
+    }
+
+    return res.json({ ok: true, configured: true, services });
+  } catch (error) {
+    console.error("marketfollowers-services-error", error);
+    return res.status(502).json({ ok: false, configured: true, error: error.message || "Could not fetch services" });
+  }
+});
+
+app.post("/api/admin/providers/marketfollowers/sync-orders", requireAdmin, async (_req, res) => {
+  if (!isMarketFollowersConfigured()) {
+    return res.status(400).json({ error: "MarketFollowers API key is not configured" });
+  }
+
+  try {
+    const database = await getDb();
+    const result = await syncProviderOrderStatuses(database);
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error("marketfollowers-sync-orders-error", error);
+    return res.status(500).json({ error: "Could not sync provider orders" });
   }
 });
 
@@ -2226,8 +2374,16 @@ app.post("/api/orders/create", async (req, res) => {
     });
 
     try {
+      await tryFulfillOrder(database, result.insertedId, order, serviceConfig);
+    } catch (fulfillmentError) {
+      console.error("order-fulfillment-error", fulfillmentError);
+    }
+
+    const persistedOrder = await database.collection("orders").findOne({ _id: result.insertedId });
+
+    try {
       const user = await database.collection("users").findOne({ _id: String(order.userId) });
-      await sendTelegramOrderNotification({ order, user });
+      await sendTelegramOrderNotification({ order: persistedOrder || order, user });
     } catch (notifyError) {
       console.error("telegram-order-notification-error", notifyError);
     }
@@ -2235,7 +2391,7 @@ app.post("/api/orders/create", async (req, res) => {
     res.status(201).json({
       ok: true,
       order: {
-        ...order,
+        ...(persistedOrder || order),
         _id: String(result.insertedId),
       },
       walletBalanceUsd: Number(debitedWallet.balance || 0),
@@ -2298,4 +2454,26 @@ app.get("/api/wallets/:userId/balance", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`PushGo backend running on port ${PORT}`);
+
+  if (!isMarketFollowersConfigured()) {
+    console.log("marketfollowers: auto-fulfillment disabled until MARKETFOLLOWERS_API_KEY is set");
+    return;
+  }
+
+  console.log("marketfollowers: auto-fulfillment enabled");
+
+  const runProviderSync = async () => {
+    try {
+      const database = await getDb();
+      const result = await syncProviderOrderStatuses(database);
+      if (result.updated > 0) {
+        console.log(`marketfollowers-sync: updated ${result.updated} of ${result.scanned} orders`);
+      }
+    } catch (error) {
+      console.error("marketfollowers-sync-error", error);
+    }
+  };
+
+  setTimeout(runProviderSync, 15000);
+  setInterval(runProviderSync, PROVIDER_SYNC_INTERVAL_MS);
 });

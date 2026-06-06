@@ -19,6 +19,14 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `TELEGRAM_CHAT_ID` (required to receive Telegram order notifications)
 - `TELEGRAM_THREAD_ID` (optional, for Telegram topics)
 
+## MarketFollowers auto-fulfillment
+
+- `MARKETFOLLOWERS_API_KEY` (optional until you are ready to go live)
+- `MARKETFOLLOWERS_API_URL` (optional, defaults to `https://marketfollowers.com/api/v2`)
+- `PROVIDER_SYNC_INTERVAL_MS` (optional, defaults to `120000`)
+
+When a service quality row has **Auto** enabled and a provider service id saved in admin, new customer orders are sent to MarketFollowers automatically after wallet debit. Order statuses sync from the provider on a background interval.
+
 ## Endpoints
 
 - `GET /health`
@@ -47,15 +55,20 @@ Minimal Express + MongoDB backend for PushGo Viral order flow.
 - `GET /api/admin/service-prices`
 - `POST /api/admin/service-prices`
 - `PUT /api/admin/service-prices/:key`
+- `DELETE /api/admin/service-prices/:key`
 - `GET /api/admin/catalog-options?category=instagram`
 - `PUT /api/admin/catalog-options/:category`
 - `GET /api/public/service-categories`
 - `GET /api/public/service-prices`
 - `GET /api/admin/overview`
+- `GET /api/admin/providers/marketfollowers/status`
+- `GET /api/admin/providers/marketfollowers/balance`
+- `GET /api/admin/providers/marketfollowers/services`
+- `POST /api/admin/providers/marketfollowers/sync-orders`
 
 ## MongoDB collections
 
-- `service_prices` — each quality variant is one document (`category`, `serviceType`, `qualityTier`, pricing, alerts, details, notes)
+- `service_prices` — each quality variant is one document (`category`, `serviceType`, `qualityTier`, pricing, alerts, details, notes, optional `providerServiceId` + `autoFulfillment`)
 - `catalog_options` — per-platform service type and quality tier catalogs (`category`, `serviceTypes[]`, `qualityTiers[]`)
 - `orders`, `users`, `wallets`, `wallet_transactions`, `admin_users`, `email_codes`, `mp_webhooks`, `app_settings`
 
