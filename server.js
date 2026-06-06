@@ -547,7 +547,7 @@ function getGoogleRedirectUri(req) {
 
 function buildFrontendRedirect(urlBase, hashPayload) {
   const cleanedBase = String(urlBase || FRONTEND_BASE_URL || "").replace(/\/+$/, "");
-  const target = cleanedBase.endsWith(".html") ? cleanedBase : `${cleanedBase}/index.html`;
+  const target = cleanedBase.endsWith(".html") ? cleanedBase : `${cleanedBase}/login.html`;
   return `${target}#${hashPayload}`;
 }
 
