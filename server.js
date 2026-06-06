@@ -482,6 +482,29 @@ async function generateUniqueServiceKey(database, label) {
 const ACTIVE_SERVICE_FILTER = { isActive: { $ne: false } };
 const LABEL_COLLATION = { locale: "en", strength: 2 };
 
+async function findInactiveServiceVariant(database, category, serviceMeta) {
+  const baseQuery = {
+    category,
+    serviceType: serviceMeta.serviceType,
+    isActive: false,
+  };
+
+  if (serviceMeta.qualityLabel) {
+    const byLabel = await database.collection("service_prices").findOne(
+      { ...baseQuery, qualityLabel: serviceMeta.qualityLabel },
+      { collation: LABEL_COLLATION }
+    );
+    if (byLabel) {
+      return byLabel;
+    }
+  }
+
+  return database.collection("service_prices").findOne({
+    ...baseQuery,
+    qualityTier: serviceMeta.qualityTier,
+  });
+}
+
 function splitGoogleName(name, email) {
   const cleanName = sanitizeName(name);
   if (cleanName) {
@@ -1813,6 +1836,27 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
 
     const database = await getDb();
 
+    const duplicateByQualityLabel = serviceMeta.qualityLabel
+      ? await database.collection("service_prices").findOne(
+        {
+          category,
+          serviceType: serviceMeta.serviceType,
+          qualityLabel: serviceMeta.qualityLabel,
+          ...ACTIVE_SERVICE_FILTER,
+        },
+        { collation: LABEL_COLLATION, projection: { key: 1, label: 1, qualityLabel: 1, serviceTypeLabel: 1 } }
+      )
+      : null;
+
+    if (duplicateByQualityLabel) {
+      return res.status(409).json({
+        error: "This quality already exists for this service type",
+        existingKey: duplicateByQualityLabel.key,
+        existingLabel: duplicateByQualityLabel.label,
+        serviceTypeLabel: duplicateByQualityLabel.serviceTypeLabel,
+      });
+    }
+
     const duplicateVariant = await database.collection("service_prices").findOne({
       category,
       serviceType: serviceMeta.serviceType,
@@ -1821,7 +1865,12 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     });
 
     if (duplicateVariant) {
-      return res.status(409).json({ error: "This quality already exists for this service type" });
+      return res.status(409).json({
+        error: "This quality already exists for this service type",
+        existingKey: duplicateVariant.key,
+        existingLabel: duplicateVariant.label,
+        serviceTypeLabel: duplicateVariant.serviceTypeLabel,
+      });
     }
 
     const existingLabel = await database.collection("service_prices").findOne(
@@ -1834,12 +1883,7 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     }
 
     const now = new Date();
-    const inactiveVariant = await database.collection("service_prices").findOne({
-      category,
-      serviceType: serviceMeta.serviceType,
-      qualityTier: serviceMeta.qualityTier,
-      isActive: false,
-    });
+    const inactiveVariant = await findInactiveServiceVariant(database, category, serviceMeta);
 
     if (inactiveVariant) {
       const result = await database.collection("service_prices").findOneAndUpdate(

@@ -1,11 +1,25 @@
 const { getPublicServiceTypes, getPublicQualityTiers } = require("./service-catalog-meta");
 
 function slugifyCatalogId(value) {
-  return String(value || "")
-    .trim()
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  const asciiSlug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
+
+  if (asciiSlug) {
+    return asciiSlug;
+  }
+
+  const codepoints = Array.from(raw)
+    .map((char) => char.codePointAt(0).toString(36))
+    .join("_");
+
+  return `u_${codepoints}`.slice(0, 80);
 }
 
 function titleCaseCatalogLabel(value) {

@@ -21,11 +21,25 @@ const QUALITY_TIER_PATTERNS = [
 ];
 
 function slugifyCatalogId(value) {
-  return String(value || "")
-    .trim()
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  const asciiSlug = raw
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
+
+  if (asciiSlug) {
+    return asciiSlug;
+  }
+
+  const codepoints = Array.from(raw)
+    .map((char) => char.codePointAt(0).toString(36))
+    .join("_");
+
+  return `u_${codepoints}`.slice(0, 80);
 }
 
 function titleCaseCatalogLabel(value) {
@@ -135,14 +149,19 @@ function normalizeServiceType(value, key, label, category, labelHint) {
 }
 
 function normalizeQualityTier(value, key, label, labelHint) {
+  const explicitHint = String(labelHint || "").trim();
+  if (explicitHint) {
+    const fromHint = slugifyCatalogId(explicitHint);
+    if (fromHint) {
+      return fromHint;
+    }
+  }
+
   const fromSlug = slugifyCatalogId(value);
   if (fromSlug) {
     return fromSlug;
   }
-  const fromLabel = slugifyCatalogId(labelHint);
-  if (fromLabel) {
-    return fromLabel;
-  }
+
   return inferQualityTier(key, label);
 }
 
