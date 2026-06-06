@@ -479,6 +479,9 @@ async function generateUniqueServiceKey(database, label) {
   return `${base}_${Date.now()}`;
 }
 
+const ACTIVE_SERVICE_FILTER = { isActive: { $ne: false } };
+const LABEL_COLLATION = { locale: "en", strength: 2 };
+
 function splitGoogleName(name, email) {
   const cleanName = sanitizeName(name);
   if (cleanName) {
@@ -1732,8 +1735,8 @@ app.put("/api/admin/service-prices/:key", requireAdmin, async (req, res) => {
     const database = await getDb();
 
     const duplicateLabel = await database.collection("service_prices").findOne(
-      { key: { $ne: key }, label },
-      { collation: { locale: "en", strength: 2 }, projection: { _id: 1 } }
+      { key: { $ne: key }, label, ...ACTIVE_SERVICE_FILTER },
+      { collation: LABEL_COLLATION, projection: { _id: 1 } }
     );
 
     if (duplicateLabel) {
@@ -1809,9 +1812,21 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     }
 
     const database = await getDb();
+
+    const duplicateVariant = await database.collection("service_prices").findOne({
+      category,
+      serviceType: serviceMeta.serviceType,
+      qualityTier: serviceMeta.qualityTier,
+      ...ACTIVE_SERVICE_FILTER,
+    });
+
+    if (duplicateVariant) {
+      return res.status(409).json({ error: "This quality already exists for this service type" });
+    }
+
     const existingLabel = await database.collection("service_prices").findOne(
-      { label },
-      { collation: { locale: "en", strength: 2 }, projection: { _id: 1 } }
+      { label, ...ACTIVE_SERVICE_FILTER },
+      { collation: LABEL_COLLATION, projection: { _id: 1 } }
     );
 
     if (existingLabel) {
@@ -1819,6 +1834,53 @@ app.post("/api/admin/service-prices", requireAdmin, async (req, res) => {
     }
 
     const now = new Date();
+    const inactiveVariant = await database.collection("service_prices").findOne({
+      category,
+      serviceType: serviceMeta.serviceType,
+      qualityTier: serviceMeta.qualityTier,
+      isActive: false,
+    });
+
+    if (inactiveVariant) {
+      const result = await database.collection("service_prices").findOneAndUpdate(
+        { _id: inactiveVariant._id },
+        {
+          $set: {
+            label,
+            category,
+            serviceType: serviceMeta.serviceType,
+            serviceTypeLabel: serviceMeta.serviceTypeLabel,
+            qualityTier: serviceMeta.qualityTier,
+            qualityLabel: serviceMeta.qualityLabel,
+            unitPriceUsd,
+            costPerUnitUsd,
+            minQuantity,
+            maxQuantity,
+            serviceAlert,
+            serviceDetails,
+            serviceNotes,
+            ...providerFields,
+            isActive: true,
+            updatedAt: now,
+          },
+        },
+        { returnDocument: "after" }
+      );
+
+      const reactivatedService = getUpdatedDocument(result);
+      if (!reactivatedService) {
+        return res.status(500).json({ error: "Could not restore service" });
+      }
+
+      await registerCatalogEntriesFromService(database, category, serviceMeta);
+
+      return res.status(201).json({
+        ok: true,
+        reactivated: true,
+        service: mapServiceDocument(reactivatedService),
+      });
+    }
+
     const key = await generateUniqueServiceKey(database, label);
     const service = {
       key,
