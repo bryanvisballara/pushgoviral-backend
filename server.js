@@ -5,6 +5,7 @@ const { MongoClient, ObjectId } = require("mongodb");
 const { renderVerificationEmail, renderPasswordResetEmail } = require("./email-templates/codes");
 const {
   CATEGORY_IDS,
+  SERVICE_CATEGORIES,
   inferServiceCategory,
   normalizeServiceCategory,
   getPublicServiceCategories,
@@ -709,6 +710,41 @@ async function sendBrevoEmail({ toEmail, toName, subject, htmlContent }) {
   }
 }
 
+function getCategoryDisplayLabel(categoryId) {
+  const normalized = String(categoryId || "").trim().toLowerCase();
+  const match = SERVICE_CATEGORIES.find((item) => item.id === normalized);
+  return match?.label || String(categoryId || "").trim();
+}
+
+function formatServiceDisplayName(serviceConfig) {
+  if (!serviceConfig) {
+    return "";
+  }
+
+  const category = normalizeServiceCategory(serviceConfig.category, serviceConfig.key, serviceConfig.label);
+  const meta = resolveServiceMeta({ ...serviceConfig, category }, category);
+  const platformLabel = getCategoryDisplayLabel(category);
+  const headline = [platformLabel, meta.serviceTypeLabel].filter(Boolean).join(" ");
+
+  if (meta.qualityLabel && headline) {
+    return `${headline}, ${meta.qualityLabel}`;
+  }
+
+  return headline || String(serviceConfig.label || "").trim();
+}
+
+function getOrderServiceDisplayName(order) {
+  if (order?.serviceDisplayName) {
+    return String(order.serviceDisplayName).trim();
+  }
+
+  if (order?.serviceTypeLabel || order?.qualityLabel || order?.category) {
+    return formatServiceDisplayName(order);
+  }
+
+  return String(order?.service || "").trim();
+}
+
 function escapeTelegramHtml(value) {
   return String(value || "")
     .replaceAll("&", "&amp;")
@@ -734,7 +770,7 @@ async function sendTelegramOrderNotification({ order, user }) {
     `<b>User:</b> ${userLabel || "Unknown"}`,
     `<b>Username:</b> ${escapeTelegramHtml(user?.username || "-")}`,
     `<b>Email:</b> ${escapeTelegramHtml(user?.email || "-")}`,
-    `<b>Service:</b> ${escapeTelegramHtml(order.service)}`,
+    `<b>Service:</b> ${escapeTelegramHtml(getOrderServiceDisplayName(order))}`,
     `<b>Platform:</b> ${escapeTelegramHtml(order.platform)}`,
     `<b>Link:</b> ${escapeTelegramHtml(order.link)}`,
     `<b>Quantity:</b> ${escapeTelegramHtml(order.quantity)}`,
@@ -2449,6 +2485,7 @@ app.post("/api/orders/create", async (req, res) => {
     const {
       userId,
       service,
+      serviceKey,
       platform = "Instagram",
       link,
       quantity,
@@ -2456,7 +2493,7 @@ app.post("/api/orders/create", async (req, res) => {
       status,
     } = req.body || {};
 
-    if (!userId || !service || !link) {
+    if (!userId || (!service && !serviceKey) || !link) {
       return res.status(400).json({ error: "userId, service and link are required" });
     }
 
@@ -2468,20 +2505,30 @@ app.post("/api/orders/create", async (req, res) => {
     }
 
     const database = await getDb();
+    const normalizedServiceKey = String(serviceKey || "").trim();
     const normalizedService = normalizeServiceLabel(service);
+    const serviceLookup = [{ label: normalizedService }, { key: normalizedService }];
+
+    if (normalizedServiceKey) {
+      serviceLookup.unshift({ key: normalizedServiceKey });
+    }
+
     const serviceConfig = await database.collection("service_prices").findOne({
       isActive: { $ne: false },
-      $or: [{ label: normalizedService }, { key: normalizedService }],
+      $or: serviceLookup,
     });
 
     if (!serviceConfig) {
       return res.status(400).json({ error: "Service is not available" });
     }
 
+    const mappedService = mapServiceDocument(serviceConfig);
+    const serviceDisplayName = formatServiceDisplayName(mappedService);
+
     const { minQuantity, maxQuantity } = getServiceQuantityLimits(serviceConfig);
     if (qty < minQuantity || qty > maxQuantity) {
       return res.status(400).json({
-        error: `Quantity for ${String(serviceConfig.label || normalizedService)} must be between ${minQuantity} and ${maxQuantity}`,
+        error: `Quantity for ${serviceDisplayName || String(serviceConfig.label || normalizedService)} must be between ${minQuantity} and ${maxQuantity}`,
       });
     }
 
@@ -2489,9 +2536,16 @@ app.post("/api/orders/create", async (req, res) => {
     const order = {
       userId: String(userId),
       orderNumber: String(Date.now()),
-      service: String(serviceConfig.label || normalizedService),
-      platform: String(platform),
-      description: `${String(serviceConfig.label || normalizedService)} | ${String(platform)}`,
+      serviceKey: String(mappedService.key || normalizedServiceKey || ""),
+      category: String(mappedService.category || ""),
+      serviceType: String(mappedService.serviceType || ""),
+      serviceTypeLabel: String(mappedService.serviceTypeLabel || ""),
+      qualityTier: String(mappedService.qualityTier || ""),
+      qualityLabel: String(mappedService.qualityLabel || ""),
+      service: serviceDisplayName,
+      serviceDisplayName,
+      platform: getCategoryDisplayLabel(mappedService.category) || String(platform),
+      description: `${serviceDisplayName} | ${getCategoryDisplayLabel(mappedService.category) || String(platform)}`,
       link: String(link),
       quantity: qty,
       chargeUsd: charge,
