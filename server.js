@@ -974,7 +974,40 @@ function startOfMonth(date = new Date()) {
   return new Date(Date.UTC(year, month - 1, 1, 5, 0, 0, 0));
 }
 
+function startOfYear(date = new Date()) {
+  const [year] = getReportYmd(date).split("-").map(Number);
+  return new Date(Date.UTC(year, 0, 1, 5, 0, 0, 0));
+}
+
 const NON_CANCELED_ORDER_FILTER = { status: { $ne: "canceled" } };
+
+function buildOrderMetricsPipeline(sinceDate) {
+  return [
+    {
+      $match: {
+        ...NON_CANCELED_ORDER_FILTER,
+        createdAt: { $gte: sinceDate },
+      },
+    },
+    buildOrderServiceLookupStage(),
+    { $addFields: buildOrderProfitFields() },
+    {
+      $group: {
+        _id: null,
+        revenue: { $sum: { $toDouble: "$chargeUsd" } },
+        profit: { $sum: "$computedProfit" },
+      },
+    },
+  ];
+}
+
+function readOrderMetrics(bucket) {
+  const row = Array.isArray(bucket) ? bucket[0] : null;
+  return {
+    revenue: Number(row?.revenue || 0),
+    profit: Number(row?.profit || 0),
+  };
+}
 
 function buildOrderServiceLookupStage() {
   return {
@@ -2311,31 +2344,21 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     const dayStart = startOfDay(now);
     const weekStart = startOfWeek(now);
     const monthStart = startOfMonth(now);
+    const yearStart = startOfYear(now);
 
-    const [ordersToday, ordersWeek, ordersMonth] = await Promise.all([
+    const [ordersToday, ordersWeek, ordersMonth, orderMetricsAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] =
+      await Promise.all([
       database.collection("orders").countDocuments({ createdAt: { $gte: dayStart } }),
       database.collection("orders").countDocuments({ createdAt: { $gte: weekStart } }),
       database.collection("orders").countDocuments({ createdAt: { $gte: monthStart } }),
-    ]);
-
-    const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] = await Promise.all([
       database
         .collection("orders")
         .aggregate([
-          { $match: NON_CANCELED_ORDER_FILTER },
-          { $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } },
-        ])
-        .toArray(),
-      database
-        .collection("orders")
-        .aggregate([
-          { $match: NON_CANCELED_ORDER_FILTER },
-          buildOrderServiceLookupStage(),
-          { $addFields: buildOrderProfitFields() },
           {
-            $group: {
-              _id: null,
-              total: { $sum: "$computedProfit" },
+            $facet: {
+              week: buildOrderMetricsPipeline(weekStart),
+              month: buildOrderMetricsPipeline(monthStart),
+              year: buildOrderMetricsPipeline(yearStart),
             },
           },
         ])
@@ -2413,11 +2436,13 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         .toArray(),
     ]);
 
-    const totalOrdersRevenue = Number(orderRevenueAgg[0]?.total || 0);
-    const totalOrdersProfit = Number(orderProfitAgg[0]?.total || 0);
+    const metricsByPeriod = orderMetricsAgg[0] || {};
+    const weekMetrics = readOrderMetrics(metricsByPeriod.week);
+    const monthMetrics = readOrderMetrics(metricsByPeriod.month);
+    const yearMetrics = readOrderMetrics(metricsByPeriod.year);
     const totalTopupRevenue = Number(topupRevenueAgg[0]?.total || 0);
     const totalTopupFee = Number(topupFeeAgg[0]?.total || 0);
-    const totalUtility = Number((totalOrdersProfit + totalTopupFee).toFixed(2));
+    const totalUtility = Number((yearMetrics.profit + totalTopupFee).toFixed(2));
     const totalWalletBalance = Number(totalWalletAgg[0]?.total || 0);
     const avgProfitPercent = Number(avgProfitPercentAgg[0]?.avg || 0);
     const reserveFactor = (100 - avgProfitPercent) / 100;
@@ -2430,11 +2455,15 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         ordersToday,
         ordersWeek,
         ordersMonth,
+        revenueWeek: Number(weekMetrics.revenue.toFixed(2)),
+        revenueMonth: Number(monthMetrics.revenue.toFixed(2)),
+        revenueYear: Number(yearMetrics.revenue.toFixed(2)),
+        profitWeek: Number(weekMetrics.profit.toFixed(2)),
+        profitMonth: Number(monthMetrics.profit.toFixed(2)),
+        profitYear: Number(yearMetrics.profit.toFixed(2)),
       },
       totals: {
         topupsRevenueUsd: Number(totalTopupRevenue.toFixed(2)),
-        ordersRevenueUsd: Number(totalOrdersRevenue.toFixed(2)),
-        ordersProfitUsd: Number(totalOrdersProfit.toFixed(2)),
         topupsFeeUsd: Number(totalTopupFee.toFixed(2)),
         totalUtilityUsd: totalUtility,
         totalWalletBalanceUsd: Number(totalWalletBalance.toFixed(2)),
