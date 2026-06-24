@@ -32,6 +32,14 @@ const {
   getBalance,
 } = require("./marketfollowers");
 const { tryFulfillOrder, syncProviderOrderStatuses } = require("./order-fulfillment");
+const {
+  grantWelcomeBonus,
+  evaluateWelcomeBonusAntifraud,
+  logWelcomeBonusFraudAttempt,
+  recordWelcomeBonusTarget,
+  debitWalletForOrder,
+  refundWalletDebit,
+} = require("./welcome-bonus");
 
 require("dotenv").config();
 
@@ -157,6 +165,9 @@ async function getDb() {
     await db.collection("email_codes").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     await db.collection("admin_sessions").createIndex({ token: 1 }, { unique: true });
     await db.collection("admin_sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await db.collection("welcome_bonus_targets").createIndex({ platform: 1, normalizedTarget: 1, usedWelcomeBonus: 1 });
+    await db.collection("welcome_bonus_fraud_attempts").createIndex({ createdAt: -1 });
+    await db.collection("welcome_bonus_fraud_attempts").createIndex({ reviewStatus: 1, createdAt: -1 });
     await backfillServiceCategories(db);
     await backfillServiceCatalogMeta(db);
     const catalogBackfill = await backfillCatalogOptions(db);
@@ -630,13 +641,24 @@ async function upsertGoogleUser({ database, googleProfile }) {
     });
 
     user = await database.collection("users").findOne({ _id: userId });
+
+    await database.collection("wallets").updateOne(
+      { userId },
+      {
+        $setOnInsert: { userId, currency: "USD", balance: 0, welcomeBonusBalance: 0 },
+        $set: { updatedAt: now },
+      },
+      { upsert: true }
+    );
+
+    await grantWelcomeBonus(database, userId);
   }
 
   const userId = String(user?._id || "");
   await database.collection("wallets").updateOne(
     { userId },
     {
-      $setOnInsert: { userId, currency: "USD", balance: 0 },
+      $setOnInsert: { userId, currency: "USD", balance: 0, welcomeBonusBalance: 0 },
       $set: { updatedAt: now },
     },
     { upsert: true }
@@ -1251,11 +1273,13 @@ app.post("/api/auth/register/verify", async (req, res) => {
     await database.collection("wallets").updateOne(
       { userId },
       {
-        $setOnInsert: { userId, currency: "USD", balance: 0 },
+        $setOnInsert: { userId, currency: "USD", balance: 0, welcomeBonusBalance: 0 },
         $set: { updatedAt: now },
       },
       { upsert: true }
     );
+
+    await grantWelcomeBonus(database, userId);
 
     return res.status(201).json({
       ok: true,
@@ -1615,6 +1639,139 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
   } catch (error) {
     console.error("admin-users-error", error);
     return res.status(500).json({ error: "Could not fetch users" });
+  }
+});
+
+app.get("/api/admin/antifraud/attempts", requireAdmin, async (req, res) => {
+  try {
+    const database = await getDb();
+    const reviewStatus = String(req.query?.reviewStatus || "").trim();
+    const search = String(req.query?.q || "").trim();
+    const filter = {};
+
+    if (reviewStatus) {
+      filter.reviewStatus = reviewStatus;
+    }
+
+    if (search) {
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { userId: regex },
+        { userEmail: regex },
+        { userUsername: regex },
+        { normalizedTarget: regex },
+        { link: regex },
+        { matchedUserId: regex },
+      ];
+    }
+
+    const attempts = await database
+      .collection("welcome_bonus_fraud_attempts")
+      .find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(200)
+      .toArray();
+
+    return res.json({ ok: true, attempts });
+  } catch (error) {
+    console.error("admin-antifraud-attempts-error", error);
+    return res.status(500).json({ error: "Could not fetch antifraud attempts" });
+  }
+});
+
+app.patch("/api/admin/antifraud/attempts/:id", requireAdmin, async (req, res) => {
+  try {
+    const attemptId = String(req.params?.id || "").trim();
+    const reviewStatus = String(req.body?.reviewStatus || "").trim();
+    const adminNotes = String(req.body?.adminNotes || "").trim();
+    const allowed = new Set(["pending_review", "dismissed", "user_blocked"]);
+
+    if (!attemptId || !allowed.has(reviewStatus)) {
+      return res.status(400).json({ error: "Invalid attempt id or review status" });
+    }
+
+    const database = await getDb();
+    const now = new Date();
+    const result = await database.collection("welcome_bonus_fraud_attempts").findOneAndUpdate(
+      { _id: attemptId },
+      {
+        $set: {
+          reviewStatus,
+          adminNotes,
+          reviewedAt: now,
+          reviewedBy: String(req.adminSession?.admin?.username || req.adminSession?.admin?.email || "admin"),
+          updatedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    const updated = getUpdatedDocument(result);
+    if (!updated) {
+      return res.status(404).json({ error: "Attempt not found" });
+    }
+
+    if (reviewStatus === "user_blocked" && updated.userId) {
+      await database.collection("users").updateOne(
+        { _id: String(updated.userId) },
+        {
+          $set: {
+            status: "blocked",
+            blockedReason: "welcome_bonus_fraud",
+            blockedAt: now,
+            updatedAt: now,
+          },
+        }
+      );
+    }
+
+    return res.json({ ok: true, attempt: updated });
+  } catch (error) {
+    console.error("admin-antifraud-update-error", error);
+    return res.status(500).json({ error: "Could not update antifraud attempt" });
+  }
+});
+
+app.patch("/api/admin/users/:userId/status", requireAdmin, async (req, res) => {
+  try {
+    const userId = String(req.params?.userId || "").trim();
+    const status = String(req.body?.status || "").trim().toLowerCase();
+    const allowed = new Set(["active", "blocked", "inactive"]);
+
+    if (!userId || !allowed.has(status)) {
+      return res.status(400).json({ error: "Invalid user id or status" });
+    }
+
+    const database = await getDb();
+    const now = new Date();
+    const update = {
+      status,
+      updatedAt: now,
+    };
+
+    if (status === "active") {
+      update.blockedReason = null;
+      update.blockedAt = null;
+    } else {
+      update.blockedReason = String(req.body?.blockedReason || "admin_action");
+      update.blockedAt = now;
+    }
+
+    const result = await database.collection("users").findOneAndUpdate(
+      { _id: userId },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+
+    const updated = getUpdatedDocument(result);
+    if (!updated) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.json({ ok: true, user: updated });
+  } catch (error) {
+    console.error("admin-user-status-error", error);
+    return res.status(500).json({ error: "Could not update user status" });
   }
 });
 
@@ -2533,6 +2690,39 @@ app.post("/api/orders/create", async (req, res) => {
     }
 
     const now = new Date();
+    const orderPlatform = getCategoryDisplayLabel(mappedService.category) || String(platform);
+    const antifraud = await evaluateWelcomeBonusAntifraud(database, {
+      userId: String(userId),
+      link: String(link),
+      platform: orderPlatform,
+      chargeUsd: charge,
+    });
+
+    if (antifraud.blocked) {
+      const user = await database.collection("users").findOne({ _id: String(userId) });
+      await logWelcomeBonusFraudAttempt(database, {
+        userId: String(userId),
+        userEmail: user?.email || "",
+        userUsername: user?.username || "",
+        link: String(link),
+        platform: antifraud.normalized?.platform || "",
+        normalizedTarget: antifraud.normalized?.normalizedTarget || "",
+        service: serviceDisplayName,
+        chargeUsd: charge,
+        reason: antifraud.reason,
+        matchedUserId: String(antifraud.matchedRecord?.userId || ""),
+        matchedOrderId: String(antifraud.matchedRecord?.orderId || ""),
+      });
+
+      return res.status(403).json({
+        ok: false,
+        blocked: true,
+        reason: antifraud.reason,
+        message:
+          "This profile already received a service using a free welcome balance. Please add funds to continue.",
+      });
+    }
+
     const order = {
       userId: String(userId),
       orderNumber: String(Date.now()),
@@ -2544,18 +2734,22 @@ app.post("/api/orders/create", async (req, res) => {
       qualityLabel: String(mappedService.qualityLabel || ""),
       service: serviceDisplayName,
       serviceDisplayName,
-      platform: getCategoryDisplayLabel(mappedService.category) || String(platform),
-      description: `${serviceDisplayName} | ${getCategoryDisplayLabel(mappedService.category) || String(platform)}`,
+      platform: orderPlatform,
+      description: `${serviceDisplayName} | ${orderPlatform}`,
       link: String(link),
+      linkPlatform: antifraud.normalized?.platform || "",
+      normalizedTarget: antifraud.normalized?.normalizedTarget || "",
       quantity: qty,
       chargeUsd: charge,
+      usedWelcomeBonus: antifraud.welcomeBonusUsed > 0,
+      welcomeBonusAmountUsd: antifraud.welcomeBonusUsed,
       status: normalizeStatus(status),
       createdAt: now,
       updatedAt: now,
     };
 
-    const debitedWallet = await debitWalletBalance(database, order.userId, charge);
-    if (!debitedWallet) {
+    const debitResult = await debitWalletForOrder(database, order.userId, charge);
+    if (!debitResult) {
       return res.status(409).json({ error: "Insufficient wallet balance" });
     }
 
@@ -2563,10 +2757,20 @@ app.post("/api/orders/create", async (req, res) => {
     try {
       result = await database.collection("orders").insertOne(order);
     } catch (insertError) {
-      await creditWalletBalance(database, order.userId, charge).catch((refundError) => {
+      await refundWalletDebit(database, order.userId, charge, debitResult.welcomeBonusUsed).catch((refundError) => {
         console.error("order-wallet-refund-error", refundError);
       });
       throw insertError;
+    }
+
+    if (debitResult.welcomeBonusUsed > 0 && antifraud.normalized?.platform && antifraud.normalized?.normalizedTarget) {
+      await recordWelcomeBonusTarget(database, {
+        platform: antifraud.normalized.platform,
+        normalizedTarget: antifraud.normalized.normalizedTarget,
+        orderId: String(result.insertedId),
+        userId: order.userId,
+        link: order.link,
+      });
     }
 
     database.collection("wallet_transactions").insertOne({
@@ -2577,6 +2781,7 @@ app.post("/api/orders/create", async (req, res) => {
       userId: String(order.userId),
       orderId: String(result.insertedId),
       amountUsd: charge,
+      welcomeBonusAmountUsd: debitResult.welcomeBonusUsed,
       createdAt: now,
       updatedAt: now,
     }).catch((walletTxError) => {
@@ -2604,7 +2809,7 @@ app.post("/api/orders/create", async (req, res) => {
         ...(persistedOrder || order),
         _id: String(result.insertedId),
       },
-      walletBalanceUsd: Number(debitedWallet.balance || 0),
+      walletBalanceUsd: Number(debitResult.wallet.balance || 0),
     });
   } catch (error) {
     console.error("create-order-error", error);
@@ -2654,6 +2859,7 @@ app.get("/api/wallets/:userId/balance", async (req, res) => {
       ok: true,
       userId,
       balance: Number(wallet?.balance || 0),
+      welcomeBonusBalance: Number(wallet?.welcomeBonusBalance || 0),
       currency: String(wallet?.currency || "USD"),
     });
   } catch (error) {
