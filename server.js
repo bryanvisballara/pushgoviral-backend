@@ -941,22 +941,37 @@ function normalizeStatus(input) {
   return allowed.has(value) ? value : "pending";
 }
 
+const ADMIN_REPORT_TIMEZONE = "America/Bogota";
+
+function getWeekdayInReportTimezone(date = new Date()) {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: ADMIN_REPORT_TIMEZONE,
+    weekday: "short",
+  }).format(date);
+  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return map[weekday] ?? 0;
+}
+
+function getReportYmd(date = new Date()) {
+  return date.toLocaleDateString("en-CA", { timeZone: ADMIN_REPORT_TIMEZONE });
+}
+
 function startOfDay(date = new Date()) {
-  const value = new Date(date);
-  value.setHours(0, 0, 0, 0);
-  return value;
+  const [year, month, day] = getReportYmd(date).split("-").map(Number);
+  // Colombia has no DST (UTC-5): local midnight = 05:00 UTC.
+  return new Date(Date.UTC(year, month - 1, day, 5, 0, 0, 0));
 }
 
 function startOfWeek(date = new Date()) {
-  const value = startOfDay(date);
-  const day = value.getDay();
-  const diff = day === 0 ? 6 : day - 1;
-  value.setDate(value.getDate() - diff);
-  return value;
+  const dayStart = startOfDay(date);
+  const weekday = getWeekdayInReportTimezone(date);
+  const diff = weekday === 0 ? 6 : weekday - 1;
+  return new Date(dayStart.getTime() - diff * 24 * 60 * 60 * 1000);
 }
 
 function startOfMonth(date = new Date()) {
-  return new Date(date.getFullYear(), date.getMonth(), 1);
+  const [year, month] = getReportYmd(date).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, 1, 5, 0, 0, 0));
 }
 
 function toObjectId(id) {
@@ -2384,6 +2399,7 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
 
     return res.json({
       ok: true,
+      timezone: ADMIN_REPORT_TIMEZONE,
       kpis: {
         ordersToday,
         ordersWeek,
