@@ -980,29 +980,12 @@ function buildOrderServiceLookupStage() {
   return {
     $lookup: {
       from: "service_prices",
-      let: {
-        serviceKey: { $ifNull: ["$serviceKey", ""] },
-        serviceName: { $ifNull: ["$service", ""] },
-        serviceDisplayName: { $ifNull: ["$serviceDisplayName", ""] },
-      },
+      let: { serviceKey: { $ifNull: ["$serviceKey", ""] } },
       pipeline: [
         {
           $match: {
             $expr: {
-              $or: [
-                {
-                  $and: [{ $gt: [{ $strLenCP: "$$serviceKey" }, 0] }, { $eq: ["$key", "$$serviceKey"] }],
-                },
-                {
-                  $and: [{ $gt: [{ $strLenCP: "$$serviceName" }, 0] }, { $eq: ["$label", "$$serviceName"] }],
-                },
-                {
-                  $and: [
-                    { $gt: [{ $strLenCP: "$$serviceDisplayName" }, 0] },
-                    { $eq: ["$label", "$$serviceDisplayName"] },
-                  ],
-                },
-              ],
+              $and: [{ $gt: [{ $strLenCP: "$$serviceKey" }, 0] }, { $eq: ["$key", "$$serviceKey"] }],
             },
           },
         },
@@ -1013,24 +996,18 @@ function buildOrderServiceLookupStage() {
   };
 }
 
-function buildOrderCostField() {
+function buildOrderProfitFields() {
   return {
-    computedCost: {
-      $let: {
-        vars: {
-          unitCost: { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] } },
-          providerCost: {
-            $convert: { input: "$providerChargeUsd", to: "double", onError: null, onNull: null },
-          },
-        },
-        in: {
-          $cond: [
-            { $and: [{ $ne: ["$$providerCost", null] }, { $gte: ["$$providerCost", 0] }] },
-            "$$providerCost",
-            { $multiply: [{ $toDouble: "$quantity" }, "$$unitCost"] },
+    computedProfit: {
+      $multiply: [
+        {
+          $subtract: [
+            { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.unitPriceUsd", 0] }, 0] } },
+            { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] } },
           ],
         },
-      },
+        { $toDouble: { $ifNull: ["$quantity", 0] } },
+      ],
     },
   };
 }
@@ -2354,16 +2331,11 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         .aggregate([
           { $match: NON_CANCELED_ORDER_FILTER },
           buildOrderServiceLookupStage(),
-          { $addFields: buildOrderCostField() },
-          {
-            $addFields: {
-              computedCharge: { $toDouble: "$chargeUsd" },
-            },
-          },
+          { $addFields: buildOrderProfitFields() },
           {
             $group: {
               _id: null,
-              total: { $sum: { $subtract: ["$computedCharge", "$computedCost"] } },
+              total: { $sum: "$computedProfit" },
             },
           },
         ])
