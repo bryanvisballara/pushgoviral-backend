@@ -974,6 +974,67 @@ function startOfMonth(date = new Date()) {
   return new Date(Date.UTC(year, month - 1, 1, 5, 0, 0, 0));
 }
 
+const NON_CANCELED_ORDER_FILTER = { status: { $ne: "canceled" } };
+
+function buildOrderServiceLookupStage() {
+  return {
+    $lookup: {
+      from: "service_prices",
+      let: {
+        serviceKey: { $ifNull: ["$serviceKey", ""] },
+        serviceName: { $ifNull: ["$service", ""] },
+        serviceDisplayName: { $ifNull: ["$serviceDisplayName", ""] },
+      },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $or: [
+                {
+                  $and: [{ $gt: [{ $strLenCP: "$$serviceKey" }, 0] }, { $eq: ["$key", "$$serviceKey"] }],
+                },
+                {
+                  $and: [{ $gt: [{ $strLenCP: "$$serviceName" }, 0] }, { $eq: ["$label", "$$serviceName"] }],
+                },
+                {
+                  $and: [
+                    { $gt: [{ $strLenCP: "$$serviceDisplayName" }, 0] },
+                    { $eq: ["$label", "$$serviceDisplayName"] },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        { $limit: 1 },
+      ],
+      as: "serviceCfg",
+    },
+  };
+}
+
+function buildOrderCostField() {
+  return {
+    computedCost: {
+      $let: {
+        vars: {
+          unitCost: { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] } },
+          providerCost: {
+            $convert: { input: "$providerChargeUsd", to: "double", onError: null, onNull: null },
+          },
+        },
+        in: {
+          $cond: [
+            { $and: [{ $ne: ["$$providerCost", null] }, { $gte: ["$$providerCost", 0] }] },
+            "$$providerCost",
+            { $multiply: [{ $toDouble: "$quantity" }, "$$unitCost"] },
+          ],
+        },
+      },
+    },
+  };
+}
+
 function toObjectId(id) {
   if (!id || !ObjectId.isValid(id)) {
     return null;
@@ -2281,28 +2342,21 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     ]);
 
     const [orderRevenueAgg, orderProfitAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] = await Promise.all([
-      database.collection("orders").aggregate([{ $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } }]).toArray(),
       database
         .collection("orders")
         .aggregate([
-          {
-            $lookup: {
-              from: "service_prices",
-              localField: "service",
-              foreignField: "label",
-              as: "serviceCfg",
-            },
-          },
-          {
-            $addFields: {
-              unitCost: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] },
-            },
-          },
+          { $match: NON_CANCELED_ORDER_FILTER },
+          { $group: { _id: null, total: { $sum: { $toDouble: "$chargeUsd" } } } },
+        ])
+        .toArray(),
+      database
+        .collection("orders")
+        .aggregate([
+          { $match: NON_CANCELED_ORDER_FILTER },
+          buildOrderServiceLookupStage(),
+          { $addFields: buildOrderCostField() },
           {
             $addFields: {
-              computedCost: {
-                $multiply: [{ $toDouble: "$quantity" }, { $toDouble: "$unitCost" }],
-              },
               computedCharge: { $toDouble: "$chargeUsd" },
             },
           },
