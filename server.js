@@ -40,6 +40,7 @@ const {
   debitWalletForOrder,
   refundWalletDebit,
 } = require("./welcome-bonus");
+const { buildServicePriceIndex, calculateOrderPeriodMetrics } = require("./order-metrics");
 
 require("dotenv").config();
 
@@ -981,68 +982,19 @@ function startOfYear(date = new Date()) {
 
 const NON_CANCELED_ORDER_FILTER = { status: { $ne: "canceled" } };
 
-function buildOrderMetricsPipeline(sinceDate) {
-  return [
-    {
-      $match: {
+async function calculatePeriodOrderMetrics(database, sinceDate) {
+  const [orders, services] = await Promise.all([
+    database
+      .collection("orders")
+      .find({
         ...NON_CANCELED_ORDER_FILTER,
         createdAt: { $gte: sinceDate },
-      },
-    },
-    buildOrderServiceLookupStage(),
-    { $addFields: buildOrderProfitFields() },
-    {
-      $group: {
-        _id: null,
-        revenue: { $sum: { $toDouble: "$chargeUsd" } },
-        profit: { $sum: "$computedProfit" },
-      },
-    },
-  ];
-}
+      })
+      .toArray(),
+    database.collection("service_prices").find({ isActive: { $ne: false } }).toArray(),
+  ]);
 
-function readOrderMetrics(bucket) {
-  const row = Array.isArray(bucket) ? bucket[0] : null;
-  return {
-    revenue: Number(row?.revenue || 0),
-    profit: Number(row?.profit || 0),
-  };
-}
-
-function buildOrderServiceLookupStage() {
-  return {
-    $lookup: {
-      from: "service_prices",
-      let: { serviceKey: { $ifNull: ["$serviceKey", ""] } },
-      pipeline: [
-        {
-          $match: {
-            $expr: {
-              $and: [{ $gt: [{ $strLenCP: "$$serviceKey" }, 0] }, { $eq: ["$key", "$$serviceKey"] }],
-            },
-          },
-        },
-        { $limit: 1 },
-      ],
-      as: "serviceCfg",
-    },
-  };
-}
-
-function buildOrderProfitFields() {
-  return {
-    computedProfit: {
-      $multiply: [
-        {
-          $subtract: [
-            { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.unitPriceUsd", 0] }, 0] } },
-            { $toDouble: { $ifNull: [{ $arrayElemAt: ["$serviceCfg.costPerUnitUsd", 0] }, 0] } },
-          ],
-        },
-        { $toDouble: { $ifNull: ["$quantity", 0] } },
-      ],
-    },
-  };
+  return calculateOrderPeriodMetrics(orders, buildServicePriceIndex(services));
 }
 
 function toObjectId(id) {
@@ -2346,23 +2298,14 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
     const monthStart = startOfMonth(now);
     const yearStart = startOfYear(now);
 
-    const [ordersToday, ordersWeek, ordersMonth, orderMetricsAgg, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] =
+    const [ordersToday, ordersWeek, ordersMonth, weekMetrics, monthMetrics, yearMetrics, topupRevenueAgg, topupFeeAgg, totalWalletAgg, avgProfitPercentAgg] =
       await Promise.all([
       database.collection("orders").countDocuments({ createdAt: { $gte: dayStart } }),
       database.collection("orders").countDocuments({ createdAt: { $gte: weekStart } }),
       database.collection("orders").countDocuments({ createdAt: { $gte: monthStart } }),
-      database
-        .collection("orders")
-        .aggregate([
-          {
-            $facet: {
-              week: buildOrderMetricsPipeline(weekStart),
-              month: buildOrderMetricsPipeline(monthStart),
-              year: buildOrderMetricsPipeline(yearStart),
-            },
-          },
-        ])
-        .toArray(),
+      calculatePeriodOrderMetrics(database, weekStart),
+      calculatePeriodOrderMetrics(database, monthStart),
+      calculatePeriodOrderMetrics(database, yearStart),
       database
         .collection("wallet_transactions")
         .aggregate([
@@ -2436,10 +2379,6 @@ app.get("/api/admin/overview", requireAdmin, async (_req, res) => {
         .toArray(),
     ]);
 
-    const metricsByPeriod = orderMetricsAgg[0] || {};
-    const weekMetrics = readOrderMetrics(metricsByPeriod.week);
-    const monthMetrics = readOrderMetrics(metricsByPeriod.month);
-    const yearMetrics = readOrderMetrics(metricsByPeriod.year);
     const totalTopupRevenue = Number(topupRevenueAgg[0]?.total || 0);
     const totalTopupFee = Number(topupFeeAgg[0]?.total || 0);
     const totalUtility = Number((yearMetrics.profit + totalTopupFee).toFixed(2));
@@ -2812,6 +2751,8 @@ app.post("/api/orders/create", async (req, res) => {
       normalizedTarget: antifraud.normalized?.normalizedTarget || "",
       quantity: qty,
       chargeUsd: charge,
+      unitPriceUsd: Number(mappedService.unitPriceUsd || 0),
+      costPerUnitUsd: Number(mappedService.costPerUnitUsd || 0),
       usedWelcomeBonus: antifraud.welcomeBonusUsed > 0,
       welcomeBonusAmountUsd: antifraud.welcomeBonusUsed,
       status: normalizeStatus(status),
