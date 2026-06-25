@@ -4,6 +4,10 @@ const crypto = require("crypto");
 const { MongoClient, ObjectId } = require("mongodb");
 const { renderVerificationEmail, renderPasswordResetEmail } = require("./email-templates/codes");
 const {
+  renderRegistrationNotificationEmail,
+  renderOrderNotificationEmail,
+} = require("./email-templates/notifications");
+const {
   CATEGORY_IDS,
   SERVICE_CATEGORIES,
   inferServiceCategory,
@@ -78,6 +82,11 @@ const USER_SESSION_TTL_MS = Number(process.env.USER_SESSION_TTL_MS || 1000 * 60 
 const BREVO_API_KEY = process.env.BREVO_API_KEY || "";
 const BREVO_SENDER_NAME = process.env.BREVO_SENDER_NAME || "PushGo Viral";
 const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || "";
+const NOTIFICATIONS_EMAIL = process.env.NOTIFICATIONS_EMAIL || "notifications@pushgoviral.com";
+const ACCOUNTS_SENDER_EMAIL = process.env.ACCOUNTS_SENDER_EMAIL || "accounts@pushgoviral.com";
+const ACCOUNTS_SENDER_NAME = process.env.ACCOUNTS_SENDER_NAME || "PushGo Viral Accounts";
+const ORDERS_SENDER_EMAIL = process.env.ORDERS_SENDER_EMAIL || "orders@pushgoviral.com";
+const ORDERS_SENDER_NAME = process.env.ORDERS_SENDER_NAME || "PushGo Viral Orders";
 const CODE_EXPIRES_MINUTES = Number(process.env.AUTH_CODE_EXPIRES_MINUTES || 10);
 const CODE_MAX_ATTEMPTS = Number(process.env.AUTH_CODE_MAX_ATTEMPTS || 5);
 const CODE_RESEND_COOLDOWN_SECONDS = Number(process.env.AUTH_CODE_RESEND_COOLDOWN_SECONDS || 60);
@@ -653,6 +662,12 @@ async function upsertGoogleUser({ database, googleProfile }) {
     );
 
     await grantWelcomeBonus(database, userId);
+
+    try {
+      await sendRegistrationNotificationEmail(user);
+    } catch (notifyError) {
+      console.error("registration-notification-email-error", notifyError);
+    }
   }
 
   const userId = String(user?._id || "");
@@ -699,9 +714,12 @@ function getUpdatedDocument(result) {
   return result;
 }
 
-async function sendBrevoEmail({ toEmail, toName, subject, htmlContent }) {
-  if (!BREVO_API_KEY || !BREVO_SENDER_EMAIL) {
-    throw new Error("Missing BREVO_API_KEY or BREVO_SENDER_EMAIL");
+async function sendBrevoEmail({ toEmail, toName, subject, htmlContent, senderEmail, senderName }) {
+  const resolvedSenderEmail = senderEmail || BREVO_SENDER_EMAIL;
+  const resolvedSenderName = senderName || BREVO_SENDER_NAME;
+
+  if (!BREVO_API_KEY || !resolvedSenderEmail) {
+    throw new Error("Missing BREVO_API_KEY or sender email");
   }
 
   const response = await fetch("https://api.brevo.com/v3/smtp/email", {
@@ -713,8 +731,8 @@ async function sendBrevoEmail({ toEmail, toName, subject, htmlContent }) {
     },
     body: JSON.stringify({
       sender: {
-        name: BREVO_SENDER_NAME,
-        email: BREVO_SENDER_EMAIL,
+        name: resolvedSenderName,
+        email: resolvedSenderEmail,
       },
       to: [
         {
@@ -773,6 +791,51 @@ function escapeTelegramHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+async function sendRegistrationNotificationEmail(user) {
+  if (!NOTIFICATIONS_EMAIL || !ACCOUNTS_SENDER_EMAIL) {
+    return;
+  }
+
+  const fullName = [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+  const subject = `PushGo Viral | New registration — ${fullName || user.username || user.email}`;
+
+  await sendBrevoEmail({
+    senderEmail: ACCOUNTS_SENDER_EMAIL,
+    senderName: ACCOUNTS_SENDER_NAME,
+    toEmail: NOTIFICATIONS_EMAIL,
+    toName: "PushGo Notifications",
+    subject,
+    htmlContent: renderRegistrationNotificationEmail({
+      user: {
+        ...user,
+        id: user.id || user._id,
+      },
+    }),
+  });
+}
+
+async function sendOrderNotificationEmail({ order, user }) {
+  if (!NOTIFICATIONS_EMAIL || !ORDERS_SENDER_EMAIL) {
+    return;
+  }
+
+  const serviceDisplayName = getOrderServiceDisplayName(order);
+  const subject = `PushGo Viral | New order #${order.orderNumber} — ${serviceDisplayName}`;
+
+  await sendBrevoEmail({
+    senderEmail: ORDERS_SENDER_EMAIL,
+    senderName: ORDERS_SENDER_NAME,
+    toEmail: NOTIFICATIONS_EMAIL,
+    toName: "PushGo Notifications",
+    subject,
+    htmlContent: renderOrderNotificationEmail({
+      order,
+      user,
+      serviceDisplayName,
+    }),
+  });
 }
 
 async function sendTelegramOrderNotification({ order, user }) {
@@ -1318,6 +1381,21 @@ app.post("/api/auth/register/verify", async (req, res) => {
     );
 
     await grantWelcomeBonus(database, userId);
+
+    try {
+      await sendRegistrationNotificationEmail({
+        _id: userId,
+        firstName,
+        lastName,
+        username,
+        email,
+        provider: "local",
+        status: "active",
+        createdAt: now,
+      });
+    } catch (notifyError) {
+      console.error("registration-notification-email-error", notifyError);
+    }
 
     return res.status(201).json({
       ok: true,
@@ -2807,12 +2885,19 @@ app.post("/api/orders/create", async (req, res) => {
     }
 
     const persistedOrder = await database.collection("orders").findOne({ _id: result.insertedId });
+    const user = await database.collection("users").findOne({ _id: String(order.userId) });
+    const notificationOrder = persistedOrder || order;
 
     try {
-      const user = await database.collection("users").findOne({ _id: String(order.userId) });
-      await sendTelegramOrderNotification({ order: persistedOrder || order, user });
+      await sendTelegramOrderNotification({ order: notificationOrder, user });
     } catch (notifyError) {
       console.error("telegram-order-notification-error", notifyError);
+    }
+
+    try {
+      await sendOrderNotificationEmail({ order: notificationOrder, user });
+    } catch (notifyError) {
+      console.error("order-notification-email-error", notifyError);
     }
 
     res.status(201).json({
